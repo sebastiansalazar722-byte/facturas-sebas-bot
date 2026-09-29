@@ -1,0 +1,16 @@
+.env
+credentials.json
+token.json
+google-service-account.json
+*.pem
+facturas.db
+*.sqlite
+*.sqlite3
+*_backup_*.csv
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.log
+.vscode/
+.idea/

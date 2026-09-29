@@ -1,0 +1,55 @@
+services:
+  - type: cron
+    name: facturas-sebas-bot
+    runtime: python
+    schedule: "0 13,19,01 * * *"
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python factura_bot_google_sheets_v11_render.py --run-now"
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: facturas-sebas-db
+          property: connectionString
+      - key: GOOGLE_SHEETS_ENABLED
+        value: "true"
+      - key: GOOGLE_SPREADSHEET_ID
+        value: "1cHEw8eLyw1K1L-Ti0uiTa9Lsb-HkYTlKwqgNBLHd0Fw"
+      - key: GOOGLE_CREDENTIALS_FILE
+        value: "credentials.json"
+      - key: GOOGLE_TOKEN_FILE
+        value: "token.json"
+      - key: GOOGLE_FACTURAS_SHEET
+        value: "hoja1"
+      - key: GOOGLE_ANALYSIS_SHEET
+        value: "Análisis"
+      - key: IMAP_HOST
+        sync: false
+      - key: IMAP_PORT
+        value: "993"
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: EMAIL_ADDRESS
+        sync: false
+      - key: EMAIL_PASSWORD
+        sync: false
+      - key: INBOX_FOLDER
+        value: "INBOX"
+      - key: REPORT_TO
+        sync: false
+      - key: EXCLUDE_EMAIL
+        sync: false
+      - key: USE_SSL_IMAP
+        value: "true"
+      - key: USE_SSL_SMTP
+        value: "false"
+      - key: SMTP_STARTTLS
+        value: "true"
+      - key: RUN_TIME
+        value: "08:00"
+
+
+databases:
+  - name: facturas-sebas-db
+    plan: free
