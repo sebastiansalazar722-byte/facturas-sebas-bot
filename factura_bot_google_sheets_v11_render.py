@@ -1177,6 +1177,20 @@ def extract_supplier_from_asunto_detalle(asunto: str) -> str:
     if not text or ";" not in text:
         return ""
 
+    def looks_like_invoice_field(part: str) -> bool:
+        value = normalize_spaces(part)
+        if not value:
+            return False
+        if re.fullmatch(r"[\d .()\-]+", value):
+            return False
+        if re.search(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", value):
+            return False
+        if re.search(r"@|https?://", value, re.I):
+            return False
+        # Typical invoice/consecutive formats: FE94506, FEA 325,
+        # FEPI 40716, PV15077, EMD326070635, etc.
+        return bool(re.search(r"[A-Za-z]{1,8}[- ]?\d{2,}", value))
+
     for raw_line in re.split(r"[\r\n]+", text):
         line = normalize_spaces(raw_line)
         if not line or ";" not in line:
@@ -1199,7 +1213,7 @@ def extract_supplier_from_asunto_detalle(asunto: str) -> str:
 
             # Invoice-like field: contains letters/numbers and is not merely
             # a date, phone, money amount, NIT or generic quantity.
-            if _looks_like_invoice_candidate(part):
+            if looks_like_invoice_field(part):
                 invoice_indexes.append(i)
 
         candidates = []
@@ -1262,7 +1276,7 @@ def extract_supplier_from_asunto_detalle(asunto: str) -> str:
             # If the next field looks like an invoice, this is a plausible
             # supplier-first structure. Require a company-name signal so we
             # don't accidentally classify arbitrary text as a provider.
-            if i + 1 < len(parts) and _looks_like_invoice_candidate(parts[i + 1]):
+            if i + 1 < len(parts) and looks_like_invoice_field(parts[i + 1]):
                 upper = supplier.upper()
                 if any(term in upper for term in (
                     "SAS", "S.A.S", "LTDA", "S.A.", "LIMITADA",
