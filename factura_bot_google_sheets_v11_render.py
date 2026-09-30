@@ -983,6 +983,50 @@ def extract_supplier_name_from_text(text: str) -> str:
     return ""
 
 
+def extract_structured_email_invoice_and_supplier(subject: str, body_text: str) -> Tuple[str, str]:
+    """Read the common DIAN forwarding subject format: NIT;SELLER;INVOICE;... .
+
+    This is a fallback after XML/PDF, but before the generic email text parser.
+    It is useful when the attachment is missing/unreadable while the forwarding
+    subject still contains the seller and invoice consecutive.
+    """
+    texts = [subject or "", body_text or ""]
+    for text in texts:
+        for raw_line in re.split(r"[\r\n]+", text):
+            line = normalize_spaces(raw_line)
+            if not line or ";" not in line:
+                continue
+            parts = [normalize_spaces(x) for x in line.split(";")]
+            if len(parts) < 3:
+                continue
+            nit = re.sub(r"\D", "", parts[0])
+            seller = _clean_supplier_name(parts[1])
+            candidate = parts[2].strip()
+            if not (6 <= len(nit) <= 15):
+                continue
+            if len(seller) < 3 or _looks_like_technical_provider(seller):
+                continue
+            # Invoice IDs in these forwarded messages are alphanumeric. Reject
+            # obvious non-invoice fields and authorization artifacts.
+            if not re.fullmatch(r"[A-Z0-9][A-Z0-9 ._-]{1,30}", candidate, flags=re.I):
+                continue
+            invoice = _normalize_invoice_candidate(candidate)
+            if _is_bad_invoice_candidate(invoice, line):
+                continue
+            # A seller should look like a legal/business name or at least not a
+            # date/phone/address field.
+            if re.fullmatch(r"[\d .()\-]+", seller):
+                continue
+            return invoice, seller
+    return "", ""
+
+
+def extract_supplier_name_from_email_text(subject: str, body_text: str) -> str:
+    """Find the seller in common forwarded invoice subject/body structures."""
+    _, supplier = extract_structured_email_invoice_and_supplier(subject, body_text)
+    return supplier
+
+
 def extract_supplier_name_from_attachments(msg: email.message.Message) -> str:
     for filename, payload in iter_supported_attachment_files(msg):
         if filename.lower().endswith(".xml"):
@@ -1275,18 +1319,9 @@ def process_mail_once(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
 ) -> dict:
-    """Process mail, using small batches for historical ranges to control RAM.
-
-    Historical runs are deliberately single-pass and synchronized to Sheets after
-    every batch. Daily/scheduler runs keep the existing second verification.
-    """
-    historical_range = bool(start_date and end_date)
-
-    if historical_range:
+    if start_date and end_date:
         start_dt, end_dt, stored_date = build_custom_range_local(start_date, end_date)
         logging.info("Iniciando proceso para rango %s - %s", start_date, end_date)
-        # A historical rebuild must not run the expensive second pass.
-        recheck = False
     else:
         now = datetime.now().astimezone()
         stored_date = now.strftime("%Y-%m-%d")
@@ -1298,80 +1333,89 @@ def process_mail_once(
     skipped_excluded = 0
     candidate_messages = 0
 
+    # Historical rebuilds can contain hundreds of PDF/XML attachments.
+    # Process them in small batches so a 512 MB Render instance does not
+    # accumulate parsed email/PDF objects until the very end. Each batch is
+    # persisted and synced to Sheets before moving on to the next one.
+    batch_size = 25 if (start_date and end_date) else 50
+
     with connect_imap(cfg) as mail:
         ids = search_candidates(mail, start_dt, end_dt)
         candidate_messages = len(ids)
+        logging.info(
+            "Mensajes candidatos: %s | procesamiento por lotes de %s",
+            candidate_messages, batch_size,
+        )
 
-        if historical_range:
-            batch_size = 25
-            batches = [ids[i:i + batch_size] for i in range(0, len(ids), batch_size)]
-            total_batches = len(batches)
+        for batch_start in range(0, len(ids), batch_size):
+            batch = ids[batch_start:batch_start + batch_size]
+            batch_number = batch_start // batch_size + 1
+            total_batches = (len(ids) + batch_size - 1) // batch_size
             logging.info(
-                "Mensajes candidatos: %s | procesamiento por lotes de %s",
-                candidate_messages, batch_size
+                "Procesando lote %s/%s (%s mensajes)...",
+                batch_number, total_batches, len(batch),
             )
 
-            for batch_no, batch_ids in enumerate(batches, start=1):
-                logging.info(
-                    "Procesando lote %s/%s (%s mensajes)...",
-                    batch_no, total_batches, len(batch_ids)
-                )
-                batch_inserted, batch_skipped = _scan_and_store(
-                    mail=mail,
-                    ids=batch_ids,
-                    db_path=DB_PATH,
-                    stored_date=stored_date,
-                    start_dt=start_dt,
-                    end_dt=end_dt,
-                    cfg=cfg,
-                )
-                inserted_first_pass += batch_inserted
-                skipped_excluded += batch_skipped
-
-                # Sync after every batch so progress is preserved even if a later
-                # batch exhausts the memory available to the Render job.
-                try:
-                    all_records = get_all_stored_invoices(DB_PATH)
-                    batch_sheets_result = sync_to_google_sheets(cfg, all_records)
-                    logging.info("Lote %s/%s sincronizado: %s", batch_no, total_batches, batch_sheets_result)
-                except Exception as exc:
-                    logging.exception(
-                        "No fue posible sincronizar Google Sheets en lote %s/%s: %s",
-                        batch_no, total_batches, exc
-                    )
-
-                gc.collect()
-        else:
-            inserted_first_pass, skipped_excluded = _scan_and_store(
+            batch_inserted, batch_skipped = _scan_and_store(
                 mail=mail,
-                ids=ids,
+                ids=batch,
                 db_path=DB_PATH,
                 stored_date=stored_date,
                 start_dt=start_dt,
                 end_dt=end_dt,
                 cfg=cfg,
             )
+            inserted_first_pass += batch_inserted
+            skipped_excluded += batch_skipped
 
-            if recheck:
-                logging.info("Ejecutando segunda verificación del filtro...")
-                ids_again = search_candidates(mail, start_dt, end_dt)
-                inserted_second_pass, _ = _scan_and_store(
-                    mail=mail,
-                    ids=ids_again,
-                    db_path=DB_PATH,
-                    stored_date=stored_date,
-                    start_dt=start_dt,
-                    end_dt=end_dt,
-                    cfg=cfg,
-                )
+            # Release the batch's message/attachment objects before the next
+            # batch. gc.collect() is intentional here because PDF parsers can
+            # retain cyclic references for a while.
+            del batch
+            gc.collect()
+
+            # For historical/custom ranges, the first pass is enough. The old
+            # second pass doubled the amount of PDF/XML work and was a major
+            # source of memory pressure. Normal daily runs keep recheck=True.
+            if cfg.google_sheets_enabled:
+                try:
+                    batch_records = get_all_stored_invoices(DB_PATH)
+                    sync_result = sync_to_google_sheets(cfg, batch_records)
+                    logging.info(
+                        "Lote %s/%s sincronizado: %s",
+                        batch_number, total_batches, sync_result,
+                    )
+                    del batch_records
+                except Exception as exc:
+                    logging.exception(
+                        "No fue posible sincronizar Google Sheets tras el lote %s: %s",
+                        batch_number, exc,
+                    )
+                gc.collect()
+
+        if recheck and not (start_date and end_date):
+            logging.info("Ejecutando segunda verificación del filtro...")
+            ids_again = search_candidates(mail, start_dt, end_dt)
+            inserted_second_pass, _ = _scan_and_store(
+                mail=mail,
+                ids=ids_again,
+                db_path=DB_PATH,
+                stored_date=stored_date,
+                start_dt=start_dt,
+                end_dt=end_dt,
+                cfg=cfg,
+            )
+            del ids_again
+            gc.collect()
 
     stored_records = get_stored_invoices(DB_PATH, stored_date)
     total_count = len(stored_records)
     total_sum = sum(r.valor_entero for r in stored_records)
 
-    # Final sync also rebuilds the monthly analysis from the complete DB history.
     sheets_result = {"enabled": False, "inserted": 0}
     try:
+        # Sync the complete SQLite history, not only today's records, so the
+        # monthly analysis can be rebuilt consistently after every run.
         all_records = get_all_stored_invoices(DB_PATH)
         sheets_result = sync_to_google_sheets(cfg, all_records)
     except Exception as exc:
@@ -1451,28 +1495,50 @@ def _scan_and_store(
 
             # The invoice document is the source of truth. Prefer XML/PDF
             # over the email subject/body because email templates vary by sender.
+            attachment_names = [name for name, _payload in iter_supported_attachment_files(msg)]
             invoice_number = extract_invoice_number_from_attachments(msg)
+            supplier_name = extract_supplier_name_from_attachments(msg)
+            logging.info(
+                "DIAGNOSTICO ADJUNTOS | uid=%s | archivos=%s | factura_doc=%s | proveedor_doc=%s",
+                uid, attachment_names, invoice_number or "VACIO", supplier_name or "VACIO"
+            )
+
+            # If the attachment is missing/unreadable, many forwarding systems
+            # put NIT;SELLER;INVOICE in the subject. Use that before generic
+            # email-text heuristics or the sender address.
+            structured_invoice, structured_supplier = extract_structured_email_invoice_and_supplier(
+                subject, body_text
+            )
+            if not invoice_number and structured_invoice:
+                invoice_number = structured_invoice
+            if not supplier_name and structured_supplier:
+                supplier_name = structured_supplier
+
             if not invoice_number:
                 invoice_number = extract_invoice_number(haystack)
-
-            # El proveedor se intenta obtener del documento, no del software remitente.
-            supplier_name = extract_supplier_name_from_attachments(msg)
+                if invoice_number:
+                    logging.info("DIAGNOSTICO FACTURA | fuente=email | factura=%s", invoice_number)
+            if not supplier_name:
+                supplier_name = extract_supplier_name_from_email_text(subject, body_text)
+                if supplier_name:
+                    logging.info("DIAGNOSTICO PROVEEDOR | fuente=email_estructurado | proveedor=%s", supplier_name)
             if not supplier_name:
                 supplier_name = _supplier_name(from_real)
+                logging.info("DIAGNOSTICO PROVEEDOR | fuente=remitente | proveedor=%s", supplier_name)
 
-            # Prioridad: valor etiquetado en texto -> adjunto -> fallback números
-            best_value = find_best_total_by_labels(haystack)
+            # The document is the source of truth for the amount too. Prefer
+            # XML/PDF TOTAL/PayableAmount over the email body, because email
+            # templates often contain unrelated numbers such as NITs, IDs or
+            # message metadata. Only fall back to the email when the attachment
+            # has no usable total.
+            best_value = extract_best_value_from_attachments(msg)
             if best_value is None:
-                best_value = extract_best_value_from_attachments(msg)
+                best_value = find_best_total_by_labels(haystack)
 
             if best_value is not None:
                 selected_values = [best_value]
             else:
                 values = extract_invoice_values(haystack)
-                if not values:
-                    att_val = extract_best_value_from_attachments(msg)
-                    if att_val:
-                        values = [att_val]
                 if not values:
                     continue
                 selected_values = [max(values, key=lambda x: x[0])]
@@ -1833,9 +1899,12 @@ def main() -> int:
             raise ValueError("Debes usar --start-date y --end-date juntos.")
 
         if args.run_now:
+            # Custom historical ranges are processed in a single pass.
+            # Daily runs retain the original second verification.
+            historical_range = bool(args.start_date and args.end_date)
             result = process_mail_once(
                 cfg,
-                recheck=True,
+                recheck=not historical_range,
                 start_date=args.start_date,
                 end_date=args.end_date,
             )
