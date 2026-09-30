@@ -88,6 +88,8 @@ TOTAL_LABEL_PATTERNS = [
     r"total\s*a\s*pagar",
     r"total\s*neto",
     r"valor\s*total",
+    r"valor\s*a\s*pagar",
+    r"total\s*de\s*la\s*factura",
     r"monto\s*total",
     r"total\s*factura",
     r"importe\s*total",
@@ -494,44 +496,115 @@ def parse_value_from_text(raw: str) -> Optional[int]:
 
 
 def find_best_total_by_labels(text: str) -> Optional[Tuple[int, str, str]]:
+    """
+    Encuentra el valor TOTAL usando contexto de etiqueta.
+
+    Importante: muchos PDF de facturas extraen la etiqueta y el valor en
+    líneas/columnas separadas. Por eso no dependemos únicamente de que
+    "TOTAL NETO" y "$100,000" estén en la misma línea.
+    """
     if not text:
         return None
-    normalized = text.replace("\r", "\n")
-    normalized = re.sub(r"[ \t]+", " ", normalized)
 
-    candidate_patterns = [
-        r"(total\s*a\s*pagar)[^\d$€]{0,30}([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
-        r"(total\s*neto)[^\d$€]{0,30}([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
-        r"(valor\s*total)[^\d$€]{0,30}([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
-        r"(monto\s*total)[^\d$€]{0,30}([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
-        r"(importe\s*total)[^\d$€]{0,30}([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
-        r"(^|\n)\s*(total)\s*[:\-]?\s*([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
+    normalized = text.replace("\r", "\n")
+    lines = [normalize_spaces(x) for x in normalized.splitlines()]
+    lines = [x for x in lines if x]
+
+    # 1) Etiqueta y valor en la misma línea.
+    same_line_patterns = [
+        (r"total\s*a\s*pagar", 100),
+        (r"total\s*neto", 95),
+        (r"valor\s*total", 90),
+        (r"monto\s*total", 90),
+        (r"total\s*factura", 90),
+        (r"importe\s*total", 90),
+        (r"^\s*total\s*$", 85),
+        (r"^\s*total\s*[:\-]", 85),
     ]
 
-    for pattern in candidate_patterns:
-        for match in re.finditer(pattern, normalized, flags=re.IGNORECASE | re.MULTILINE):
-            label = match.group(1 if match.lastindex and match.lastindex >= 2 else 0)
-            raw_value = match.group(match.lastindex)
-            window_start = max(0, match.start() - 40)
-            window = normalized[window_start:match.end()].lower()
-            if any(re.search(p, window) for p in IGNORE_LABEL_PATTERNS if p not in label.lower()):
-                # allow if label is the exact priority one; ignore surrounding "subtotal"/"iva"
-                pass
-            value_int = parse_value_from_text(raw_value)
-            if value_int is not None and value_int > 0:
-                return value_int, detect_currency(raw_value), raw_value.strip()
+    candidates: List[Tuple[int, int, str, str]] = []
 
-    # Fallback line-by-line: choose a line with total-like label and not ignored label.
-    for line in normalized.splitlines():
+    for i, line in enumerate(lines):
         low = line.lower()
-        if any(re.search(p, low) for p in TOTAL_LABEL_PATTERNS) and not any(re.search(p, low) for p in IGNORE_LABEL_PATTERNS):
-            vals = extract_invoice_values(line)
-            if vals:
-                vals.sort(key=lambda x: x[0], reverse=True)
-                return vals[0]
+        for label_pattern, score in same_line_patterns:
+            if re.search(label_pattern, low, re.I):
+                # Do not treat subtotal/IVA/other component rows as TOTAL.
+                if any(re.search(pat, low, re.I) for pat in IGNORE_LABEL_PATTERNS):
+                    # "TOTAL NETO" is explicitly allowed.
+                    if not re.search(r"total\s*neto|total\s*a\s*pagar|valor\s*total|total\s*factura|importe\s*total", low, re.I):
+                        continue
+                vals = extract_invoice_values(line)
+                if vals:
+                    value, currency, literal = max(vals, key=lambda x: x[0])
+                    candidates.append((score, i, literal, currency))
+                    # Keep actual value encoded through a separate lookup below.
+                    candidates[-1] = (score, i, literal, currency)
+
+    if candidates:
+        # Priority by label strength, then prefer a larger explicitly labeled
+        # total only as a tiebreaker.
+        best = sorted(candidates, key=lambda x: (-x[0], x[1]))[0]
+        value = clean_currency_to_int(best[2])
+        return value, detect_currency(best[2]), best[2]
+
+    # 2) Critical fallback: label and amount in adjacent PDF extraction lines.
+    # This is the case for EFFISYSTEMS FE-94506:
+    #   TOTAL NETO
+    #   $100,000
+    # or the amount may be 1-5 lines away because of PDF columns.
+    label_patterns = [
+        (r"total\s*a\s*pagar", 100),
+        (r"total\s*neto", 95),
+        (r"valor\s*total", 90),
+        (r"monto\s*total", 90),
+        (r"total\s*factura", 90),
+        (r"importe\s*total", 90),
+        (r"^\s*total\s*$", 85),
+    ]
+
+    for i, line in enumerate(lines):
+        low = line.lower()
+        label_score = None
+        for pat, score in label_patterns:
+            if re.search(pat, low, re.I):
+                label_score = score
+                break
+        if label_score is None:
+            continue
+
+        # Ignore component labels, but never ignore explicit total-neto /
+        # total-a-pagar rows.
+        if any(re.search(pat, low, re.I) for pat in IGNORE_LABEL_PATTERNS):
+            if not re.search(r"total\s*neto|total\s*a\s*pagar|valor\s*total|total\s*factura|importe\s*total", low, re.I):
+                continue
+
+        for j in range(i + 1, min(len(lines), i + 7)):
+            candidate_line = lines[j]
+            vals = extract_invoice_values(candidate_line)
+            if not vals:
+                # Sometimes the extractor keeps "$" on one line and the number
+                # on the next. Try the combined local window.
+                continue
+
+            # Prefer values that look like money, and reject tiny isolated
+            # quantities such as "1".
+            vals = [v for v in vals if v[0] >= 10]
+            if not vals:
+                continue
+
+            value, currency, literal = max(vals, key=lambda x: x[0])
+            return value, currency, literal
+
+        # Also inspect the same local block as a last resort. This catches
+        # layouts where the total label is followed by several table cells
+        # before the amount.
+        block = "\n".join(lines[i:i+8])
+        vals = [v for v in extract_invoice_values(block) if v[0] >= 10]
+        if vals:
+            value, currency, literal = max(vals, key=lambda x: x[0])
+            return value, currency, literal
 
     return None
-
 
 def _normalize_invoice_candidate(raw: str) -> str:
     """Normalize an invoice identifier while preserving meaningful prefix/number."""
@@ -787,132 +860,96 @@ def extract_invoice_number_from_xml_bytes(xml_bytes: bytes) -> str:
 
 
 def extract_values_from_xml_bytes(xml_bytes: bytes) -> List[Tuple[int, str, str]]:
-    """
-    Extrae el valor de la factura desde XML DIAN sin confundir cantidades,
-    descripciones, NIT, consecutivos u otros numeros del documento.
+    """Extract the invoice total without confusing quantities/text for money.
 
-    Caso importante: muchos correos DIAN entregan un AttachedDocument que
-    contiene la factura real dentro de un CDATA como texto. En ese caso hay
-    que localizar y parsear la Invoice interna antes de buscar los totales.
-    """
-    def _parse_xml_amount(raw: str) -> int:
-        """Convierte montos UBL como 100000.0000 en 100000 COP."""
-        value = (raw or "").strip().replace(",", "")
-        from decimal import Decimal, InvalidOperation
-        try:
-            number = Decimal(value)
-        except InvalidOperation as exc:
-            raise ValueError(f"Monto XML no interpretable: {raw}") from exc
-        return int(number)
+    Supports both:
+      1) a direct UBL Invoice XML
+      2) a DIAN AttachedDocument whose real Invoice is embedded in CDATA.
 
-    def _invoice_roots_from_text(text: str) -> List[ET.Element]:
-        roots: List[ET.Element] = []
-        # Si el texto contiene una Invoice embebida dentro de CDATA, extraer
-        # desde <Invoice ...> hasta </Invoice> y parsearla por separado.
-        for match in re.finditer(r"<Invoice\b[\s\S]*?</Invoice>", text, flags=re.IGNORECASE):
-            fragment = match.group(0)
+    Priority:
+      LegalMonetaryTotal/PayableAmount
+      LegalMonetaryTotal/TaxInclusiveAmount
+      global PayableAmount only as a conservative fallback
+    """
+    def _parse_invoice_root(root):
+        # If this is already an Invoice, use it.
+        root_tag = root.tag.split("}")[-1]
+        if root_tag == "Invoice":
+            return root
+
+        # DIAN AttachedDocument: the real Invoice is commonly embedded inside
+        # cac:ExternalReference/cbc:Description as CDATA.
+        for elem in root.iter():
+            tag = elem.tag.split("}")[-1]
+            if tag != "Description":
+                continue
+            inner = (elem.text or "").strip()
+            if "<Invoice" not in inner:
+                continue
             try:
-                roots.append(ET.fromstring(fragment))
+                inner_root = ET.fromstring(inner)
             except Exception:
                 continue
-        return roots
+            if inner_root.tag.split("}")[-1] == "Invoice":
+                return inner_root
+
+        return root
 
     try:
         root = ET.fromstring(xml_bytes)
     except Exception:
         return []
 
-    invoice_roots: List[ET.Element] = []
-    root_tag = root.tag.split("}")[-1]
+    invoice_root = _parse_invoice_root(root)
 
-    # XML DIAN directo: ya es la factura.
-    if root_tag == "Invoice":
-        invoice_roots.append(root)
+    # 1) Strict UBL monetary total: this is the authoritative invoice total.
+    legal_totals = [
+        elem for elem in invoice_root.iter()
+        if elem.tag.split("}")[-1] == "LegalMonetaryTotal"
+    ]
 
-    # XML DIAN AttachedDocument: la factura real suele estar dentro de
-    # cac:ExternalReference/cbc:Description como CDATA.
-    for elem in root.iter():
-        text = elem.text or ""
-        if "<Invoice" in text or "<invoice" in text:
-            invoice_roots.extend(_invoice_roots_from_text(text))
-
-    # Algunos XML pueden traer un Invoice como nodo hijo real.
-    if not invoice_roots:
-        for elem in root.iter():
-            if elem.tag.split("}")[-1] == "Invoice":
-                invoice_roots.append(elem)
-
-    # Evitar duplicados por referencia.
-    unique_roots: List[ET.Element] = []
-    seen_ids = set()
-    for item in invoice_roots:
-        marker = id(item)
-        if marker not in seen_ids:
-            seen_ids.add(marker)
-            unique_roots.append(item)
-
-    if not unique_roots:
-        return []
-
-    # La factura real debe ganar siempre: LegalMonetaryTotal -> PayableAmount.
-    # No buscamos el maximo de todos los numeros del XML.
-    for invoice_root in unique_roots:
-        legal_totals = [
-            elem for elem in invoice_root.iter()
-            if elem.tag.split("}")[-1] == "LegalMonetaryTotal"
-        ]
-        for legal_total in legal_totals:
-            payable = next(
-                (elem for elem in legal_total.iter()
-                 if elem.tag.split("}")[-1] == "PayableAmount"),
-                None,
-            )
-            if payable is not None and (payable.text or "").strip():
-                raw = (payable.text or "").strip()
+    for legal_total in legal_totals:
+        children = list(legal_total)
+        for wanted_tag in ("PayableAmount", "TaxInclusiveAmount"):
+            for child in children:
+                if child.tag.split("}")[-1] != wanted_tag:
+                    continue
+                raw = (child.text or "").strip()
+                if not raw:
+                    continue
                 try:
-                    value = _parse_xml_amount(raw)
-                    if value > 0:
-                        currency = payable.attrib.get("currencyID") or detect_currency(raw)
-                        return [(value, currency, raw)]
+                    # XML monetary amounts use a decimal point.
+                    value = Decimal(raw)
                 except Exception:
-                    pass
+                    continue
+                if value < 0:
+                    continue
+                return [(int(value), child.attrib.get("currencyID", "N/A"), raw)]
 
-            # Respaldo estructurado dentro del mismo LegalMonetaryTotal.
-            for tag_name in ("TaxInclusiveAmount", "TaxExclusiveAmount", "LineExtensionAmount"):
-                candidate = next(
-                    (elem for elem in legal_total.iter()
-                     if elem.tag.split("}")[-1] == tag_name),
-                    None,
-                )
-                if candidate is not None and (candidate.text or "").strip():
-                    raw = (candidate.text or "").strip()
-                    try:
-                        value = _parse_xml_amount(raw)
-                        if value > 0:
-                            currency = candidate.attrib.get("currencyID") or detect_currency(raw)
-                            return [(value, currency, raw)]
-                    except Exception:
-                        pass
+    # 2) Conservative fallback: a direct PayableAmount on the invoice.
+    for elem in invoice_root.iter():
+        if elem.tag.split("}")[-1] != "PayableAmount":
+            continue
+        raw = (elem.text or "").strip()
+        if not raw:
+            continue
+        try:
+            value = Decimal(raw)
+        except Exception:
+            continue
+        if value < 0:
+            continue
+        return [(int(value), elem.attrib.get("currencyID", "N/A"), raw)]
 
-    # Ultimo respaldo: PayableAmount global SOLO dentro de la Invoice real.
-    for invoice_root in unique_roots:
-        for elem in invoice_root.iter():
-            if elem.tag.split("}")[-1] != "PayableAmount":
-                continue
-            raw = (elem.text or "").strip()
-            if not raw:
-                continue
-            try:
-                value = _parse_xml_amount(raw)
-                if value > 0:
-                    currency = elem.attrib.get("currencyID") or detect_currency(raw)
-                    return [(value, currency, raw)]
-            except Exception:
-                continue
+    # 3) Last fallback: only a clearly labelled total in the XML text.
+    text_blobs = []
+    for elem in invoice_root.iter():
+        value = (elem.text or "").strip()
+        if value:
+            text_blobs.append(f"{elem.tag.split('}')[-1]}: {value}")
 
-    # No usar numeros sueltos del AttachedDocument/XML como valor.
-    # Eso evita errores como 1.000 de InvoicedQuantity o de una descripcion.
-    return []
+    best = find_best_total_by_labels("\\n".join(text_blobs))
+    return [best] if best else []
 
 def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
     # PyMuPDF usually preserves the invoice header/layout better than pypdf.
@@ -1071,6 +1108,191 @@ def extract_supplier_name_from_text(text: str) -> str:
     return ""
 
 
+def extract_structured_email_invoice_and_supplier(subject: str, body_text: str) -> Tuple[str, str]:
+    """Read the common DIAN forwarding subject format: NIT;SELLER;INVOICE;... .
+
+    This is a fallback after XML/PDF, but before the generic email text parser.
+    It is useful when the attachment is missing/unreadable while the forwarding
+    subject still contains the seller and invoice consecutive.
+    """
+    texts = [subject or "", body_text or ""]
+    for text in texts:
+        for raw_line in re.split(r"[\r\n]+", text):
+            line = normalize_spaces(raw_line)
+            if not line or ";" not in line:
+                continue
+            parts = [normalize_spaces(x) for x in line.split(";")]
+            if len(parts) < 3:
+                continue
+            nit = re.sub(r"\D", "", parts[0])
+            seller = _clean_supplier_name(parts[1])
+            candidate = parts[2].strip()
+            if not (6 <= len(nit) <= 15):
+                continue
+            if len(seller) < 3 or _looks_like_technical_provider(seller):
+                continue
+            # Invoice IDs in these forwarded messages are alphanumeric. Reject
+            # obvious non-invoice fields and authorization artifacts.
+            if not re.fullmatch(r"[A-Z0-9][A-Z0-9 ._-]{1,30}", candidate, flags=re.I):
+                continue
+            invoice = _normalize_invoice_candidate(candidate)
+            # In this explicit NIT;SELLER;INVOICE structure, a numeric
+            # consecutive is valid too (some providers use long numeric
+            # invoice numbers). Do not apply the generic bare-number rejection
+            # here; the field position gives it strong context.
+            if not invoice or len(invoice.replace(" ", "")) > 30:
+                continue
+            if re.fullmatch(r"[A-Z0-9][A-Z0-9 ._-]{1,30}", candidate, flags=re.I) is None:
+                continue
+            # A seller should look like a legal/business name or at least not a
+            # date/phone/address field.
+            if re.fullmatch(r"[\d .()\-]+", seller):
+                continue
+            return invoice, seller
+    return "", ""
+
+
+def extract_supplier_from_asunto_detalle(asunto: str) -> str:
+    """Extract the supplier from common invoice-forwarding subject formats.
+
+    Do NOT assume the supplier is always the second field.
+
+    Supported common patterns include:
+        NIT;PROVEEDOR;FACTURA;...
+        PROVEEDOR;NIT;FACTURA;...
+        PROVEEDOR;FACTURA;...
+        NIT;PROVEEDOR;FACTURA;...
+
+    Strategy:
+      1) Split the subject/detail into semicolon-separated fields.
+      2) Identify NIT-like numeric fields.
+      3) Identify invoice-like fields.
+      4) Treat a nearby text field that looks like a company/legal name
+         as the supplier.
+      5) If there is an explicit NIT + supplier + invoice structure, use it.
+      6) Otherwise return empty and let the existing XML/PDF/email fallback
+         decide, rather than guessing and risking SEBAS DUNCAN SAS.
+    """
+    text = decode_mime_header(asunto or "").strip()
+    if not text or ";" not in text:
+        return ""
+
+    def looks_like_invoice_field(part: str) -> bool:
+        value = normalize_spaces(part)
+        if not value:
+            return False
+        if re.fullmatch(r"[\d .()\-]+", value):
+            return False
+        if re.search(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", value):
+            return False
+        if re.search(r"@|https?://", value, re.I):
+            return False
+        # Typical invoice/consecutive formats: FE94506, FEA 325,
+        # FEPI 40716, PV15077, EMD326070635, etc.
+        return bool(re.search(r"[A-Za-z]{1,8}[- ]?\d{2,}", value))
+
+    for raw_line in re.split(r"[\r\n]+", text):
+        line = normalize_spaces(raw_line)
+        if not line or ";" not in line:
+            continue
+
+        parts = [normalize_spaces(x) for x in line.split(";") if normalize_spaces(x)]
+        if len(parts) < 2:
+            continue
+
+        # Remove obvious empty/technical noise but preserve original order.
+        nit_indexes = []
+        invoice_indexes = []
+
+        for i, part in enumerate(parts):
+            digits = re.sub(r"\D", "", part)
+
+            # Colombian NIT-like field.
+            if 6 <= len(digits) <= 15 and re.fullmatch(r"[\d .-]+", part):
+                nit_indexes.append(i)
+
+            # Invoice-like field: contains letters/numbers and is not merely
+            # a date, phone, money amount, NIT or generic quantity.
+            if looks_like_invoice_field(part):
+                invoice_indexes.append(i)
+
+        candidates = []
+
+        # A supplier is commonly adjacent to the NIT and invoice.
+        for nit_idx in nit_indexes:
+            for inv_idx in invoice_indexes:
+                if inv_idx == nit_idx:
+                    continue
+
+                for supplier_idx in range(len(parts)):
+                    if supplier_idx in (nit_idx, inv_idx):
+                        continue
+
+                    supplier = _clean_supplier_name(parts[supplier_idx])
+                    if len(supplier) < 3:
+                        continue
+                    if _looks_like_technical_provider(supplier):
+                        continue
+                    if re.fullmatch(r"[\d .()\-]+", supplier):
+                        continue
+
+                    # Prefer suppliers between NIT and invoice, then suppliers
+                    # immediately adjacent to either field.
+                    distance = abs(supplier_idx - nit_idx) + abs(supplier_idx - inv_idx)
+                    between = min(nit_idx, inv_idx) < supplier_idx < max(nit_idx, inv_idx)
+
+                    score = 0
+                    if between:
+                        score += 100
+                    if supplier_idx in (nit_idx - 1, nit_idx + 1, inv_idx - 1, inv_idx + 1):
+                        score += 30
+                    score -= distance
+
+                    # Legal/company-name signals.
+                    upper = supplier.upper()
+                    if any(term in upper for term in (
+                        "SAS", "S.A.S", "LTDA", "S.A.", "S A S", "LIMITADA",
+                        "COMERCIAL", "IMPORTADORA", "DISTRIBUIDORA",
+                        "INDUSTRIAS", "TEXTILES", "SISTEMAS",
+                    )):
+                        score += 15
+
+                    candidates.append((score, supplier))
+
+        if candidates:
+            candidates.sort(key=lambda x: (-x[0], x[1].lower()))
+            return candidates[0][1]
+
+        # Conservative fallback for a simple PROVEEDOR;FACTURA format.
+        for i, part in enumerate(parts):
+            supplier = _clean_supplier_name(part)
+            if len(supplier) < 3:
+                continue
+            if _looks_like_technical_provider(supplier):
+                continue
+            if re.fullmatch(r"[\d .()\-]+", supplier):
+                continue
+
+            # If the next field looks like an invoice, this is a plausible
+            # supplier-first structure. Require a company-name signal so we
+            # don't accidentally classify arbitrary text as a provider.
+            if i + 1 < len(parts) and looks_like_invoice_field(parts[i + 1]):
+                upper = supplier.upper()
+                if any(term in upper for term in (
+                    "SAS", "S.A.S", "LTDA", "S.A.", "LIMITADA",
+                    "COMERCIAL", "IMPORTADORA", "DISTRIBUIDORA",
+                    "INDUSTRIAS", "TEXTILES", "SISTEMAS",
+                )):
+                    return supplier
+
+    return ""
+
+def extract_supplier_name_from_email_text(subject: str, body_text: str) -> str:
+    """Find the seller in common forwarded invoice subject/body structures."""
+    _, supplier = extract_structured_email_invoice_and_supplier(subject, body_text)
+    return supplier
+
+
 def extract_supplier_name_from_attachments(msg: email.message.Message) -> str:
     for filename, payload in iter_supported_attachment_files(msg):
         if filename.lower().endswith(".xml"):
@@ -1101,29 +1323,40 @@ def extract_invoice_number_from_attachments(msg: email.message.Message) -> str:
 
 
 def extract_best_value_from_attachments(msg: email.message.Message) -> Optional[Tuple[int, str, str]]:
-    # XML tiene prioridad sobre PDF
+    """Extract invoice total using labeled PDF evidence or structured XML."""
     attachment_files = iter_supported_attachment_files(msg)
-    # First XMLs
+    xml_candidates: List[Tuple[int, str, str]] = []
+    pdf_candidates: List[Tuple[int, str, str]] = []
+
+    # Collect XML candidates without returning immediately.
     for filename, payload in attachment_files:
-        lower = filename.lower()
-        if lower.endswith(".xml"):
+        if filename.lower().endswith(".xml"):
             vals = extract_values_from_xml_bytes(payload)
             if vals:
-                return max(vals, key=lambda x: x[0])
-    # Then PDFs
-    for filename, payload in attachment_files:
-        lower = filename.lower()
-        if lower.endswith(".pdf"):
-            text = extract_text_from_pdf_bytes(payload)
-            if text:
-                best = find_best_total_by_labels(text)
-                if best:
-                    return best
-                vals = extract_invoice_values(text)
-                if vals:
-                    return max(vals, key=lambda x: x[0])
-    return None
+                xml_candidates.extend(vals)
 
+    # Collect only explicitly labeled totals from PDFs.
+    for filename, payload in attachment_files:
+        if filename.lower().endswith(".pdf"):
+            pdf_text = extract_text_from_pdf_bytes(payload)
+            if pdf_text:
+                best = find_best_total_by_labels(pdf_text)
+                if best:
+                    pdf_candidates.append(best)
+
+    # If the PDF explicitly says TOTAL NETO / TOTAL A PAGAR / TOTAL, use
+    # that visible invoice total. This fixes EFFISYSTEMS FE-94506, where the
+    # PDF shows TOTAL NETO $100,000 but an ambiguous XML field can be 1.
+    if pdf_candidates:
+        pdf_candidates.sort(key=lambda x: x[0], reverse=True)
+        return pdf_candidates[0]
+
+    # Otherwise use the structured XML amount.
+    if xml_candidates:
+        xml_candidates.sort(key=lambda x: x[0], reverse=True)
+        return xml_candidates[0]
+
+    return None
 
 def attachments_contain_keyword(msg: email.message.Message) -> Optional[str]:
     for _, text in extract_attachment_texts(msg):
@@ -1363,18 +1596,9 @@ def process_mail_once(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
 ) -> dict:
-    """Process mail, using small batches for historical ranges to control RAM.
-
-    Historical runs are deliberately single-pass and synchronized to Sheets after
-    every batch. Daily/scheduler runs keep the existing second verification.
-    """
-    historical_range = bool(start_date and end_date)
-
-    if historical_range:
+    if start_date and end_date:
         start_dt, end_dt, stored_date = build_custom_range_local(start_date, end_date)
         logging.info("Iniciando proceso para rango %s - %s", start_date, end_date)
-        # A historical rebuild must not run the expensive second pass.
-        recheck = False
     else:
         now = datetime.now().astimezone()
         stored_date = now.strftime("%Y-%m-%d")
@@ -1386,80 +1610,89 @@ def process_mail_once(
     skipped_excluded = 0
     candidate_messages = 0
 
+    # Historical rebuilds can contain hundreds of PDF/XML attachments.
+    # Process them in small batches so a 512 MB Render instance does not
+    # accumulate parsed email/PDF objects until the very end. Each batch is
+    # persisted and synced to Sheets before moving on to the next one.
+    batch_size = 25 if (start_date and end_date) else 50
+
     with connect_imap(cfg) as mail:
         ids = search_candidates(mail, start_dt, end_dt)
         candidate_messages = len(ids)
+        logging.info(
+            "Mensajes candidatos: %s | procesamiento por lotes de %s",
+            candidate_messages, batch_size,
+        )
 
-        if historical_range:
-            batch_size = 25
-            batches = [ids[i:i + batch_size] for i in range(0, len(ids), batch_size)]
-            total_batches = len(batches)
+        for batch_start in range(0, len(ids), batch_size):
+            batch = ids[batch_start:batch_start + batch_size]
+            batch_number = batch_start // batch_size + 1
+            total_batches = (len(ids) + batch_size - 1) // batch_size
             logging.info(
-                "Mensajes candidatos: %s | procesamiento por lotes de %s",
-                candidate_messages, batch_size
+                "Procesando lote %s/%s (%s mensajes)...",
+                batch_number, total_batches, len(batch),
             )
 
-            for batch_no, batch_ids in enumerate(batches, start=1):
-                logging.info(
-                    "Procesando lote %s/%s (%s mensajes)...",
-                    batch_no, total_batches, len(batch_ids)
-                )
-                batch_inserted, batch_skipped = _scan_and_store(
-                    mail=mail,
-                    ids=batch_ids,
-                    db_path=DB_PATH,
-                    stored_date=stored_date,
-                    start_dt=start_dt,
-                    end_dt=end_dt,
-                    cfg=cfg,
-                )
-                inserted_first_pass += batch_inserted
-                skipped_excluded += batch_skipped
-
-                # Sync after every batch so progress is preserved even if a later
-                # batch exhausts the memory available to the Render job.
-                try:
-                    all_records = get_all_stored_invoices(DB_PATH)
-                    batch_sheets_result = sync_to_google_sheets(cfg, all_records)
-                    logging.info("Lote %s/%s sincronizado: %s", batch_no, total_batches, batch_sheets_result)
-                except Exception as exc:
-                    logging.exception(
-                        "No fue posible sincronizar Google Sheets en lote %s/%s: %s",
-                        batch_no, total_batches, exc
-                    )
-
-                gc.collect()
-        else:
-            inserted_first_pass, skipped_excluded = _scan_and_store(
+            batch_inserted, batch_skipped = _scan_and_store(
                 mail=mail,
-                ids=ids,
+                ids=batch,
                 db_path=DB_PATH,
                 stored_date=stored_date,
                 start_dt=start_dt,
                 end_dt=end_dt,
                 cfg=cfg,
             )
+            inserted_first_pass += batch_inserted
+            skipped_excluded += batch_skipped
 
-            if recheck:
-                logging.info("Ejecutando segunda verificación del filtro...")
-                ids_again = search_candidates(mail, start_dt, end_dt)
-                inserted_second_pass, _ = _scan_and_store(
-                    mail=mail,
-                    ids=ids_again,
-                    db_path=DB_PATH,
-                    stored_date=stored_date,
-                    start_dt=start_dt,
-                    end_dt=end_dt,
-                    cfg=cfg,
-                )
+            # Release the batch's message/attachment objects before the next
+            # batch. gc.collect() is intentional here because PDF parsers can
+            # retain cyclic references for a while.
+            del batch
+            gc.collect()
+
+            # For historical/custom ranges, the first pass is enough. The old
+            # second pass doubled the amount of PDF/XML work and was a major
+            # source of memory pressure. Normal daily runs keep recheck=True.
+            if cfg.google_sheets_enabled:
+                try:
+                    batch_records = get_all_stored_invoices(DB_PATH)
+                    sync_result = sync_to_google_sheets(cfg, batch_records)
+                    logging.info(
+                        "Lote %s/%s sincronizado: %s",
+                        batch_number, total_batches, sync_result,
+                    )
+                    del batch_records
+                except Exception as exc:
+                    logging.exception(
+                        "No fue posible sincronizar Google Sheets tras el lote %s: %s",
+                        batch_number, exc,
+                    )
+                gc.collect()
+
+        if recheck and not (start_date and end_date):
+            logging.info("Ejecutando segunda verificación del filtro...")
+            ids_again = search_candidates(mail, start_dt, end_dt)
+            inserted_second_pass, _ = _scan_and_store(
+                mail=mail,
+                ids=ids_again,
+                db_path=DB_PATH,
+                stored_date=stored_date,
+                start_dt=start_dt,
+                end_dt=end_dt,
+                cfg=cfg,
+            )
+            del ids_again
+            gc.collect()
 
     stored_records = get_stored_invoices(DB_PATH, stored_date)
     total_count = len(stored_records)
     total_sum = sum(r.valor_entero for r in stored_records)
 
-    # Final sync also rebuilds the monthly analysis from the complete DB history.
     sheets_result = {"enabled": False, "inserted": 0}
     try:
+        # Sync the complete SQLite history, not only today's records, so the
+        # monthly analysis can be rebuilt consistently after every run.
         all_records = get_all_stored_invoices(DB_PATH)
         sheets_result = sync_to_google_sheets(cfg, all_records)
     except Exception as exc:
@@ -1533,39 +1766,91 @@ def _scan_and_store(
                 skipped_excluded += 1
                 continue
 
+            # Some forwarding systems send a complete structured invoice
+            # record in the subject/detail, for example:
+            # NIT;PROVEEDOR;FACTURA;...
+            # Those emails are valid invoice candidates even when the words
+            # "factura" or "invoice" do not appear anywhere in the text.
+            # Detect this BEFORE the keyword gate so they are not discarded.
+            structured_invoice, structured_supplier = extract_structured_email_invoice_and_supplier(
+                subject, body_text
+            )
+
             keyword = body_keyword or attachment_keyword
+            if not keyword and structured_invoice:
+                keyword = "factura"
+                logging.info(
+                    "DIAGNOSTICO FILTRO | uid=%s | aceptado_por_estructura | factura=%s | proveedor=%s",
+                    uid, structured_invoice, structured_supplier or "VACIO",
+                )
+
             if not keyword:
                 continue
 
             # The invoice document is the source of truth. Prefer XML/PDF
             # over the email subject/body because email templates vary by sender.
-            invoice_number = extract_invoice_number_from_attachments(msg)
+            attachment_names = [name for name, _payload in iter_supported_attachment_files(msg)]
+            # The structured seller/consecutive pair takes priority over the
+            # PDF/XML extraction when present because it is normalized
+            # forwarding data from the invoice-processing system.
+            invoice_number = structured_invoice or extract_invoice_number_from_attachments(msg)
+            supplier_name = structured_supplier or extract_supplier_name_from_attachments(msg)
+            logging.info(
+                "DIAGNOSTICO ADJUNTOS | uid=%s | archivos=%s | factura_doc=%s | proveedor_doc=%s | estructurado=%s",
+                uid, attachment_names, invoice_number or "VACIO", supplier_name or "VACIO",
+                "SI" if structured_invoice or structured_supplier else "NO",
+            )
+
             if not invoice_number:
                 invoice_number = extract_invoice_number(haystack)
+                if invoice_number:
+                    logging.info("DIAGNOSTICO FACTURA | fuente=email | factura=%s", invoice_number)
+            # The forwarding subject/detail is the preferred supplier source.
+            # It commonly has: NIT;PROVEEDOR;FACTURA;...
+            # This avoids labeling every invoice as SEBAS DUNCAN SAS merely
+            # because the forwarding mailbox sent the email.
+            asunto_supplier = extract_supplier_from_asunto_detalle(subject)
+            if asunto_supplier:
+                supplier_name = asunto_supplier
+                logging.info(
+                    "DIAGNOSTICO PROVEEDOR | fuente=asunto_detalle | proveedor=%s",
+                    supplier_name,
+                )
 
-            # El proveedor se intenta obtener del documento, no del software remitente.
-            supplier_name = extract_supplier_name_from_attachments(msg)
+            if not supplier_name:
+                supplier_name = extract_supplier_name_from_email_text(subject, body_text)
+                if supplier_name:
+                    logging.info(
+                        "DIAGNOSTICO PROVEEDOR | fuente=email_estructurado | proveedor=%s",
+                        supplier_name,
+                    )
             if not supplier_name:
                 supplier_name = _supplier_name(from_real)
+                logging.info("DIAGNOSTICO PROVEEDOR | fuente=remitente | proveedor=%s", supplier_name)
 
-            # Prioridad: valor etiquetado en texto -> adjunto -> fallback números
-            best_value = find_best_total_by_labels(haystack)
+            # The document is the source of truth for the amount too. Prefer
+            # XML/PDF TOTAL/PayableAmount over the email body, because email
+            # templates often contain unrelated numbers such as NITs, IDs or
+            # message metadata. Only fall back to the email when the attachment
+            # has no usable total.
+            best_value = extract_best_value_from_attachments(msg)
             if best_value is None:
-                best_value = extract_best_value_from_attachments(msg)
+                best_value = find_best_total_by_labels(haystack)
 
-            if best_value is not None:
-                selected_values = [best_value]
-            else:
-                values = extract_invoice_values(haystack)
-                if not values:
-                    att_val = extract_best_value_from_attachments(msg)
-                    if att_val:
-                        values = [att_val]
-                if not values:
-                    continue
-                selected_values = [max(values, key=lambda x: x[0])]
+            if best_value is None:
+                logging.info(
+                    "DIAGNOSTICO VALOR | uid=%s | valor=VACIO | motivo=sin_total_etiquetado",
+                    uid,
+                )
+                continue
 
-            for value_int, currency, _literal in selected_values:
+            value_int, currency, literal = best_value
+            logging.info(
+                "DIAGNOSTICO VALOR | uid=%s | valor=%s | moneda=%s | literal=%r",
+                uid, value_int, currency, literal,
+            )
+
+            for value_int, currency, _literal in [best_value]:
                 rec = InvoiceRecord(
                     message_id=message_id,
                     uid=uid,
@@ -1721,7 +2006,7 @@ def _analysis_data(records: List[InvoiceRecord]) -> Tuple[List[str], List[List[o
     months = set()
 
     for rec in records:
-        provider = _supplier_name(rec.remitente_real)
+        provider = extract_supplier_from_asunto_detalle(rec.asunto) or _supplier_name(rec.remitente_real)
         month = _month_key_from_email_date(rec.email_date, rec.stored_date)
         if not month:
             logging.warning(
@@ -1786,8 +2071,16 @@ def sync_to_google_sheets(cfg: Config, records: List[InvoiceRecord]) -> dict:
         key = _sheet_message_key(rec.message_id, rec.invoice_number, rec.valor_entero)
         if key in existing_keys:
             continue
+
+        # Column F stores the original subject/detail. If it contains the
+        # forwarding structure NIT;PROVEEDOR;FACTURA;..., use that supplier
+        # for column A. Otherwise keep the supplier already stored in DB.
+        sheet_supplier = extract_supplier_from_asunto_detalle(rec.asunto)
+        if not sheet_supplier:
+            sheet_supplier = _supplier_name(rec.remitente_real)
+
         rows_to_append.append([
-            _supplier_name(rec.remitente_real),
+            sheet_supplier,
             rec.email_date,
             rec.invoice_number or "N/A",
             key,
@@ -1921,9 +2214,12 @@ def main() -> int:
             raise ValueError("Debes usar --start-date y --end-date juntos.")
 
         if args.run_now:
+            # Custom historical ranges are processed in a single pass.
+            # Daily runs retain the original second verification.
+            historical_range = bool(args.start_date and args.end_date)
             result = process_mail_once(
                 cfg,
-                recheck=True,
+                recheck=not historical_range,
                 start_date=args.start_date,
                 end_date=args.end_date,
             )
