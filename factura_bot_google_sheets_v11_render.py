@@ -496,69 +496,115 @@ def parse_value_from_text(raw: str) -> Optional[int]:
 
 
 def find_best_total_by_labels(text: str) -> Optional[Tuple[int, str, str]]:
+    """
+    Encuentra el valor TOTAL usando contexto de etiqueta.
+
+    Importante: muchos PDF de facturas extraen la etiqueta y el valor en
+    líneas/columnas separadas. Por eso no dependemos únicamente de que
+    "TOTAL NETO" y "$100,000" estén en la misma línea.
+    """
     if not text:
         return None
-    normalized = text.replace("\r", "\n")
-    normalized = re.sub(r"[ \t]+", " ", normalized)
 
-    candidate_patterns = [
-        r"(total\s*a\s*pagar)[^\d$€]{0,30}([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
-        r"(total\s*neto)[^\d$€]{0,30}([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
-        r"(valor\s*total)[^\d$€]{0,30}([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
-        r"(monto\s*total)[^\d$€]{0,30}([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
-        r"(importe\s*total)[^\d$€]{0,30}([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
-        r"(^|\n)\s*(total)\s*[:\-]?\s*([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
+    normalized = text.replace("\r", "\n")
+    lines = [normalize_spaces(x) for x in normalized.splitlines()]
+    lines = [x for x in lines if x]
+
+    # 1) Etiqueta y valor en la misma línea.
+    same_line_patterns = [
+        (r"total\s*a\s*pagar", 100),
+        (r"total\s*neto", 95),
+        (r"valor\s*total", 90),
+        (r"monto\s*total", 90),
+        (r"total\s*factura", 90),
+        (r"importe\s*total", 90),
+        (r"^\s*total\s*$", 85),
+        (r"^\s*total\s*[:\-]", 85),
     ]
 
-    for pattern in candidate_patterns:
-        for match in re.finditer(pattern, normalized, flags=re.IGNORECASE | re.MULTILINE):
-            label = match.group(1 if match.lastindex and match.lastindex >= 2 else 0)
-            raw_value = match.group(match.lastindex)
-            window_start = max(0, match.start() - 40)
-            window = normalized[window_start:match.end()].lower()
-            if any(re.search(p, window) for p in IGNORE_LABEL_PATTERNS if p not in label.lower()):
-                # allow if label is the exact priority one; ignore surrounding "subtotal"/"iva"
-                pass
-            value_int = parse_value_from_text(raw_value)
-            if value_int is not None and value_int > 0:
-                return value_int, detect_currency(raw_value), raw_value.strip()
+    candidates: List[Tuple[int, int, str, str]] = []
 
-    # Strong fallback for PDFs where the label and amount are split across
-    # columns/lines (common in invoice tables). Prefer exact total labels and
-    # explicitly reject quantity/count labels such as "Total items: 1".
-    lines = [normalize_spaces(x) for x in normalized.splitlines() if normalize_spaces(x)]
-    strong_total_re = re.compile(r"\b(total\s+neto|total\s+a\s+pagar|total\s+factura|valor\s+total|importe\s+total|monto\s+total)\b", re.I)
-    weak_total_re = re.compile(r"^\s*total\s*[:\-]?\s*([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)\s*$", re.I)
-    bad_quantity_re = re.compile(r"\btotal\s+(?:items?|unidades?|cantidad(?:es)?|productos?|art[ií]culos?)\b", re.I)
-
-    for idx, line in enumerate(lines):
+    for i, line in enumerate(lines):
         low = line.lower()
-        if bad_quantity_re.search(low):
-            continue
-        if strong_total_re.search(line):
-            # First try amount on the same line.
-            vals = extract_invoice_values(line)
-            if vals:
-                vals.sort(key=lambda x: x[0], reverse=True)
-                return vals[0]
-            # Then inspect the next 3 lines; PDF text extraction frequently
-            # separates the label from the amount.
-            for nxt in lines[idx + 1: idx + 4]:
-                if bad_quantity_re.search(nxt.lower()):
-                    continue
-                vals = extract_invoice_values(nxt)
+        for label_pattern, score in same_line_patterns:
+            if re.search(label_pattern, low, re.I):
+                # Do not treat subtotal/IVA/other component rows as TOTAL.
+                if any(re.search(pat, low, re.I) for pat in IGNORE_LABEL_PATTERNS):
+                    # "TOTAL NETO" is explicitly allowed.
+                    if not re.search(r"total\s*neto|total\s*a\s*pagar|valor\s*total|total\s*factura|importe\s*total", low, re.I):
+                        continue
+                vals = extract_invoice_values(line)
                 if vals:
-                    vals.sort(key=lambda x: x[0], reverse=True)
-                    return vals[0]
+                    value, currency, literal = max(vals, key=lambda x: x[0])
+                    candidates.append((score, i, literal, currency))
+                    # Keep actual value encoded through a separate lookup below.
+                    candidates[-1] = (score, i, literal, currency)
 
-        m = weak_total_re.search(line)
-        if m and not bad_quantity_re.search(low):
-            value_int = parse_value_from_text(m.group(1))
-            if value_int and value_int > 1:
-                return value_int, detect_currency(m.group(1)), m.group(1).strip()
+    if candidates:
+        # Priority by label strength, then prefer a larger explicitly labeled
+        # total only as a tiebreaker.
+        best = sorted(candidates, key=lambda x: (-x[0], x[1]))[0]
+        value = clean_currency_to_int(best[2])
+        return value, detect_currency(best[2]), best[2]
+
+    # 2) Critical fallback: label and amount in adjacent PDF extraction lines.
+    # This is the case for EFFISYSTEMS FE-94506:
+    #   TOTAL NETO
+    #   $100,000
+    # or the amount may be 1-5 lines away because of PDF columns.
+    label_patterns = [
+        (r"total\s*a\s*pagar", 100),
+        (r"total\s*neto", 95),
+        (r"valor\s*total", 90),
+        (r"monto\s*total", 90),
+        (r"total\s*factura", 90),
+        (r"importe\s*total", 90),
+        (r"^\s*total\s*$", 85),
+    ]
+
+    for i, line in enumerate(lines):
+        low = line.lower()
+        label_score = None
+        for pat, score in label_patterns:
+            if re.search(pat, low, re.I):
+                label_score = score
+                break
+        if label_score is None:
+            continue
+
+        # Ignore component labels, but never ignore explicit total-neto /
+        # total-a-pagar rows.
+        if any(re.search(pat, low, re.I) for pat in IGNORE_LABEL_PATTERNS):
+            if not re.search(r"total\s*neto|total\s*a\s*pagar|valor\s*total|total\s*factura|importe\s*total", low, re.I):
+                continue
+
+        for j in range(i + 1, min(len(lines), i + 7)):
+            candidate_line = lines[j]
+            vals = extract_invoice_values(candidate_line)
+            if not vals:
+                # Sometimes the extractor keeps "$" on one line and the number
+                # on the next. Try the combined local window.
+                continue
+
+            # Prefer values that look like money, and reject tiny isolated
+            # quantities such as "1".
+            vals = [v for v in vals if v[0] >= 10]
+            if not vals:
+                continue
+
+            value, currency, literal = max(vals, key=lambda x: x[0])
+            return value, currency, literal
+
+        # Also inspect the same local block as a last resort. This catches
+        # layouts where the total label is followed by several table cells
+        # before the amount.
+        block = "\n".join(lines[i:i+8])
+        vals = [v for v in extract_invoice_values(block) if v[0] >= 10]
+        if vals:
+            value, currency, literal = max(vals, key=lambda x: x[0])
+            return value, currency, literal
 
     return None
-
 
 def _normalize_invoice_candidate(raw: str) -> str:
     """Normalize an invoice identifier while preserving meaningful prefix/number."""
