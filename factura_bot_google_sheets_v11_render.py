@@ -494,44 +494,106 @@ def parse_value_from_text(raw: str) -> Optional[int]:
 
 
 def find_best_total_by_labels(text: str) -> Optional[Tuple[int, str, str]]:
+    """
+    Extrae el valor monetario REAL asociado al TOTAL de la factura.
+
+    No confunde:
+      - Total items / Total unidades / Total líneas = cantidades
+      - IVA / subtotal / precio unitario = valores auxiliares
+
+    También soporta el orden de texto defectuoso de PDFs: pypdf a veces
+    devuelve primero el importe y después el rótulo visual, o al revés.
+    """
     if not text:
         return None
+
     normalized = text.replace("\r", "\n")
     normalized = re.sub(r"[ \t]+", " ", normalized)
 
-    candidate_patterns = [
-        r"(total\s*a\s*pagar)[^\d$€]{0,30}([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
-        r"(total\s*neto)[^\d$€]{0,30}([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
-        r"(valor\s*total)[^\d$€]{0,30}([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
-        r"(monto\s*total)[^\d$€]{0,30}([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
-        r"(importe\s*total)[^\d$€]{0,30}([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
-        r"(^|\n)\s*(total)\s*[:\-]?\s*([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
+    strong_labels = [
+        r"total\s*a\s*pagar",
+        r"total\s*neto",
+        r"total\s*de\s*la\s*operaci[oó]n",
+        r"total\s*operaci[oó]n",
+        r"valor\s*total",
+        r"monto\s*total",
+        r"importe\s*total",
+        r"total\s*factura",
     ]
 
-    for pattern in candidate_patterns:
-        for match in re.finditer(pattern, normalized, flags=re.IGNORECASE | re.MULTILINE):
-            label = match.group(1 if match.lastindex and match.lastindex >= 2 else 0)
-            raw_value = match.group(match.lastindex)
-            window_start = max(0, match.start() - 40)
-            window = normalized[window_start:match.end()].lower()
-            if any(re.search(p, window) for p in IGNORE_LABEL_PATTERNS if p not in label.lower()):
-                # allow if label is the exact priority one; ignore surrounding "subtotal"/"iva"
-                pass
-            value_int = parse_value_from_text(raw_value)
-            if value_int is not None and value_int > 0:
-                return value_int, detect_currency(raw_value), raw_value.strip()
+    def money_candidates(fragment: str) -> List[Tuple[int, str, str, int]]:
+        out = []
+        for _, _, literal in _compile_money_matches(fragment):
+            try:
+                value_int = clean_currency_to_int(literal)
+            except Exception:
+                continue
+            if value_int <= 0:
+                continue
+            pos = fragment.find(literal)
+            out.append((value_int, detect_currency(literal), literal.strip(), pos))
+        return out
 
-    # Fallback line-by-line: choose a line with total-like label and not ignored label.
+    # 1. Etiquetas fuertes.
+    for label_pattern in strong_labels:
+        for m in re.finditer(label_pattern, normalized, flags=re.IGNORECASE):
+            # PRIMERO buscar hacia adelante. En UBL/PDF suele estar el importe
+            # después del rótulo. Esto evita coger IVA/subtotal que aparece antes.
+            forward = normalized[m.end():min(len(normalized), m.end() + 700)]
+            candidates = money_candidates(forward)
+            if candidates:
+                # El primer importe posterior suele ser el total mostrado.
+                return candidates[0][0], candidates[0][1], candidates[0][2]
+
+            # Si pypdf invirtió el orden, buscar hacia atrás.
+            backward = normalized[max(0, m.start() - 500):m.start()]
+            candidates = money_candidates(backward)
+            if candidates:
+                candidates.sort(key=lambda x: x[3], reverse=True)
+                return candidates[0][0], candidates[0][1], candidates[0][2]
+
+    # 2. TOTAL genérico.
+    for m in re.finditer(r"\btotal\b", normalized, flags=re.IGNORECASE):
+        immediate = normalized[max(0, m.start()-80):min(len(normalized), m.end()+120)].lower()
+
+        # Estos "totales" son cantidades, NO dinero.
+        if re.search(
+            r"total\s+(items?|unidades?|l[ií]neas?|cantidad|productos?|art[ií]culos?)",
+            immediate,
+            flags=re.IGNORECASE,
+        ):
+            continue
+
+        forward = normalized[m.end():min(len(normalized), m.end() + 500)]
+        candidates = money_candidates(forward)
+        if candidates:
+            return candidates[0][0], candidates[0][1], candidates[0][2]
+
+        backward = normalized[max(0, m.start()-350):m.start()]
+        candidates = money_candidates(backward)
+        if candidates:
+            candidates.sort(key=lambda x: x[3], reverse=True)
+            return candidates[0][0], candidates[0][1], candidates[0][2]
+
+    # 3. Último fallback por línea, excluyendo cantidades.
     for line in normalized.splitlines():
         low = line.lower()
-        if any(re.search(p, low) for p in TOTAL_LABEL_PATTERNS) and not any(re.search(p, low) for p in IGNORE_LABEL_PATTERNS):
+        if re.search(
+            r"\btotal\s+(items?|unidades?|l[ií]neas?|cantidad|productos?|art[ií]culos?)\b",
+            low,
+            flags=re.IGNORECASE,
+        ):
+            continue
+
+        if any(re.search(pat, low) for pat in TOTAL_LABEL_PATTERNS):
+            if any(re.search(pat, low) for pat in IGNORE_LABEL_PATTERNS):
+                continue
             vals = extract_invoice_values(line)
             if vals:
                 vals.sort(key=lambda x: x[0], reverse=True)
                 return vals[0]
 
     return None
-
 
 def _normalize_invoice_candidate(raw: str) -> str:
     """Normalize an invoice identifier while preserving meaningful prefix/number."""
@@ -787,44 +849,77 @@ def extract_invoice_number_from_xml_bytes(xml_bytes: bytes) -> str:
 
 
 def extract_values_from_xml_bytes(xml_bytes: bytes) -> List[Tuple[int, str, str]]:
+    """
+    Extrae el total monetario del XML DIAN sin confundir importes de líneas.
+
+    IMPORTANTE:
+    No se debe hacer "max() de cualquier PayableAmount/TaxInclusiveAmount"
+    porque algunos XML traen importes auxiliares o de línea que pueden ser
+    2.840, 1, etc.
+
+    Prioridad estricta:
+      1) LegalMonetaryTotal / PayableAmount
+      2) LegalMonetaryTotal / TaxInclusiveAmount
+      3) un PayableAmount global solo si no existe LegalMonetaryTotal
+      4) texto XML como último respaldo
+    """
     try:
         root = ET.fromstring(xml_bytes)
     except Exception:
         return []
 
-    # Primero intentar tags UBL/DIAN típicos
-    preferred_tags = [
-        "PayableAmount",
-        "LineExtensionAmount",
-        "TaxInclusiveAmount",
-        "TaxExclusiveAmount",
-        "LegalMonetaryTotal",
-    ]
+    def local(tag: str) -> str:
+        return tag.split("}")[-1].lower()
 
-    text_blobs: List[str] = []
-    best_candidates: List[Tuple[int, str, str]] = []
+    def amount_tuple(elem) -> Optional[Tuple[int, str, str]]:
+        raw = (elem.text or "").strip()
+        if not raw:
+            return None
+        value = parse_value_from_text(raw)
+        if value is None or value <= 0:
+            return None
+        return value, detect_currency(raw), raw
 
+    # 1 y 2. Buscar EXCLUSIVAMENTE dentro de LegalMonetaryTotal.
     for elem in root.iter():
-        tag = elem.tag.split("}")[-1]
-        text = (elem.text or "").strip()
-        if text:
-            text_blobs.append(f"{tag}: {text}")
-            if tag in ("PayableAmount", "TaxInclusiveAmount"):
-                val = parse_value_from_text(text)
-                if val:
-                    best_candidates.append((val, detect_currency(text), text))
+        if local(elem.tag) != "legalmonetarytotal":
+            continue
 
-    if best_candidates:
-        best_candidates.sort(key=lambda x: x[0], reverse=True)
-        return [best_candidates[0]]
+        payable = None
+        tax_inclusive = None
 
-    best = find_best_total_by_labels("\n".join(text_blobs))
+        for child in list(elem):
+            tag = local(child.tag)
+            if tag == "payableamount":
+                payable = amount_tuple(child)
+            elif tag == "taxinclusiveamount":
+                tax_inclusive = amount_tuple(child)
+
+        if payable:
+            return [payable]
+        if tax_inclusive:
+            return [tax_inclusive]
+
+    # 3. Solo si no existe LegalMonetaryTotal: PayableAmount global.
+    for elem in root.iter():
+        if local(elem.tag) == "payableamount":
+            candidate = amount_tuple(elem)
+            if candidate:
+                return [candidate]
+
+    # 4. Último respaldo textual. Nunca priorizar valores de línea por
+    # "max()", porque precisamente ahí aparece el problema de 2840.
+    blobs: List[str] = []
+    for elem in root.iter():
+        value = (elem.text or "").strip()
+        if value:
+            blobs.append(f"{local(elem.tag)}: {value}")
+
+    best = find_best_total_by_labels("\n".join(blobs))
     if best:
         return [best]
 
-    values = extract_invoice_values("\n".join(text_blobs))
-    return [max(values, key=lambda x: x[0])] if values else []
-
+    return []
 
 def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
     # PyMuPDF usually preserves the invoice header/layout better than pypdf.
