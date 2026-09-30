@@ -88,6 +88,8 @@ TOTAL_LABEL_PATTERNS = [
     r"total\s*a\s*pagar",
     r"total\s*neto",
     r"valor\s*total",
+    r"valor\s*a\s*pagar",
+    r"total\s*de\s*la\s*factura",
     r"monto\s*total",
     r"total\s*factura",
     r"importe\s*total",
@@ -818,12 +820,15 @@ def extract_values_from_xml_bytes(xml_bytes: bytes) -> List[Tuple[int, str, str]
         best_candidates.sort(key=lambda x: x[0], reverse=True)
         return [best_candidates[0]]
 
+    # No usar números sueltos del XML como "valor". En facturas DIAN el XML
+    # contiene muchos números (NIT, CUFE, consecutivos, códigos, cantidades,
+    # etc.). Si no encontramos un monto estructurado o un TOTAL etiquetado,
+    # devolvemos vacío para evitar falsos valores como 2840.
     best = find_best_total_by_labels("\n".join(text_blobs))
     if best:
         return [best]
 
-    values = extract_invoice_values("\n".join(text_blobs))
-    return [max(values, key=lambda x: x[0])] if values else []
+    return []
 
 
 def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
@@ -1011,7 +1016,13 @@ def extract_structured_email_invoice_and_supplier(subject: str, body_text: str) 
             if not re.fullmatch(r"[A-Z0-9][A-Z0-9 ._-]{1,30}", candidate, flags=re.I):
                 continue
             invoice = _normalize_invoice_candidate(candidate)
-            if _is_bad_invoice_candidate(invoice, line):
+            # In this explicit NIT;SELLER;INVOICE structure, a numeric
+            # consecutive is valid too (some providers use long numeric
+            # invoice numbers). Do not apply the generic bare-number rejection
+            # here; the field position gives it strong context.
+            if not invoice or len(invoice.replace(" ", "")) > 30:
+                continue
+            if re.fullmatch(r"[A-Z0-9][A-Z0-9 ._-]{1,30}", candidate, flags=re.I) is None:
                 continue
             # A seller should look like a legal/business name or at least not a
             # date/phone/address field.
@@ -1075,9 +1086,9 @@ def extract_best_value_from_attachments(msg: email.message.Message) -> Optional[
                 best = find_best_total_by_labels(text)
                 if best:
                     return best
-                vals = extract_invoice_values(text)
-                if vals:
-                    return max(vals, key=lambda x: x[0])
+                # Nunca elegir el mayor número del PDF como "valor".
+                # Un PDF contiene NIT, CUFE, consecutivos, teléfonos,
+                # cantidades y otros números que pueden parecer dinero.
     return None
 
 
@@ -1496,23 +1507,23 @@ def _scan_and_store(
             # The invoice document is the source of truth. Prefer XML/PDF
             # over the email subject/body because email templates vary by sender.
             attachment_names = [name for name, _payload in iter_supported_attachment_files(msg)]
-            invoice_number = extract_invoice_number_from_attachments(msg)
-            supplier_name = extract_supplier_name_from_attachments(msg)
-            logging.info(
-                "DIAGNOSTICO ADJUNTOS | uid=%s | archivos=%s | factura_doc=%s | proveedor_doc=%s",
-                uid, attachment_names, invoice_number or "VACIO", supplier_name or "VACIO"
-            )
-
-            # If the attachment is missing/unreadable, many forwarding systems
-            # put NIT;SELLER;INVOICE in the subject. Use that before generic
-            # email-text heuristics or the sender address.
+            # Some forwarding systems include a highly reliable structured
+            # record in the email body/subject: NIT;PROVEEDOR;FACTURA;...
+            # When present, this structured seller/consecutive pair takes
+            # priority over the PDF/XML extraction because it is already the
+            # normalized DIAN forwarding data used by the sender.
             structured_invoice, structured_supplier = extract_structured_email_invoice_and_supplier(
                 subject, body_text
             )
-            if not invoice_number and structured_invoice:
-                invoice_number = structured_invoice
-            if not supplier_name and structured_supplier:
-                supplier_name = structured_supplier
+
+            attachment_names = [name for name, _payload in iter_supported_attachment_files(msg)]
+            invoice_number = structured_invoice or extract_invoice_number_from_attachments(msg)
+            supplier_name = structured_supplier or extract_supplier_name_from_attachments(msg)
+            logging.info(
+                "DIAGNOSTICO ADJUNTOS | uid=%s | archivos=%s | factura_doc=%s | proveedor_doc=%s | estructurado=%s",
+                uid, attachment_names, invoice_number or "VACIO", supplier_name or "VACIO",
+                "SI" if structured_invoice or structured_supplier else "NO",
+            )
 
             if not invoice_number:
                 invoice_number = extract_invoice_number(haystack)
@@ -1535,15 +1546,20 @@ def _scan_and_store(
             if best_value is None:
                 best_value = find_best_total_by_labels(haystack)
 
-            if best_value is not None:
-                selected_values = [best_value]
-            else:
-                values = extract_invoice_values(haystack)
-                if not values:
-                    continue
-                selected_values = [max(values, key=lambda x: x[0])]
+            if best_value is None:
+                logging.info(
+                    "DIAGNOSTICO VALOR | uid=%s | valor=VACIO | motivo=sin_total_etiquetado",
+                    uid,
+                )
+                continue
 
-            for value_int, currency, _literal in selected_values:
+            value_int, currency, literal = best_value
+            logging.info(
+                "DIAGNOSTICO VALOR | uid=%s | valor=%s | moneda=%s | literal=%r",
+                uid, value_int, currency, literal,
+            )
+
+            for value_int, currency, _literal in [best_value]:
                 rec = InvoiceRecord(
                     message_id=message_id,
                     uid=uid,
