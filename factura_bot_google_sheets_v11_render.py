@@ -1093,29 +1093,40 @@ def extract_invoice_number_from_attachments(msg: email.message.Message) -> str:
 
 
 def extract_best_value_from_attachments(msg: email.message.Message) -> Optional[Tuple[int, str, str]]:
-    # XML tiene prioridad sobre PDF
+    """Extract invoice total using labeled PDF evidence or structured XML."""
     attachment_files = iter_supported_attachment_files(msg)
-    # First XMLs
+    xml_candidates: List[Tuple[int, str, str]] = []
+    pdf_candidates: List[Tuple[int, str, str]] = []
+
+    # Collect XML candidates without returning immediately.
     for filename, payload in attachment_files:
-        lower = filename.lower()
-        if lower.endswith(".xml"):
+        if filename.lower().endswith(".xml"):
             vals = extract_values_from_xml_bytes(payload)
             if vals:
-                return max(vals, key=lambda x: x[0])
-    # Then PDFs
-    for filename, payload in attachment_files:
-        lower = filename.lower()
-        if lower.endswith(".pdf"):
-            text = extract_text_from_pdf_bytes(payload)
-            if text:
-                best = find_best_total_by_labels(text)
-                if best:
-                    return best
-                # Nunca elegir el mayor número del PDF como "valor".
-                # Un PDF contiene NIT, CUFE, consecutivos, teléfonos,
-                # cantidades y otros números que pueden parecer dinero.
-    return None
+                xml_candidates.extend(vals)
 
+    # Collect only explicitly labeled totals from PDFs.
+    for filename, payload in attachment_files:
+        if filename.lower().endswith(".pdf"):
+            pdf_text = extract_text_from_pdf_bytes(payload)
+            if pdf_text:
+                best = find_best_total_by_labels(pdf_text)
+                if best:
+                    pdf_candidates.append(best)
+
+    # If the PDF explicitly says TOTAL NETO / TOTAL A PAGAR / TOTAL, use
+    # that visible invoice total. This fixes EFFISYSTEMS FE-94506, where the
+    # PDF shows TOTAL NETO $100,000 but an ambiguous XML field can be 1.
+    if pdf_candidates:
+        pdf_candidates.sort(key=lambda x: x[0], reverse=True)
+        return pdf_candidates[0]
+
+    # Otherwise use the structured XML amount.
+    if xml_candidates:
+        xml_candidates.sort(key=lambda x: x[0], reverse=True)
+        return xml_candidates[0]
+
+    return None
 
 def attachments_contain_keyword(msg: email.message.Message) -> Optional[str]:
     for _, text in extract_attachment_texts(msg):
