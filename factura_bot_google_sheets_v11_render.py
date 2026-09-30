@@ -88,8 +88,6 @@ TOTAL_LABEL_PATTERNS = [
     r"total\s*a\s*pagar",
     r"total\s*neto",
     r"valor\s*total",
-    r"valor\s*a\s*pagar",
-    r"total\s*de\s*la\s*factura",
     r"monto\s*total",
     r"total\s*factura",
     r"importe\s*total",
@@ -496,115 +494,44 @@ def parse_value_from_text(raw: str) -> Optional[int]:
 
 
 def find_best_total_by_labels(text: str) -> Optional[Tuple[int, str, str]]:
-    """
-    Encuentra el valor TOTAL usando contexto de etiqueta.
-
-    Importante: muchos PDF de facturas extraen la etiqueta y el valor en
-    líneas/columnas separadas. Por eso no dependemos únicamente de que
-    "TOTAL NETO" y "$100,000" estén en la misma línea.
-    """
     if not text:
         return None
-
     normalized = text.replace("\r", "\n")
-    lines = [normalize_spaces(x) for x in normalized.splitlines()]
-    lines = [x for x in lines if x]
+    normalized = re.sub(r"[ \t]+", " ", normalized)
 
-    # 1) Etiqueta y valor en la misma línea.
-    same_line_patterns = [
-        (r"total\s*a\s*pagar", 100),
-        (r"total\s*neto", 95),
-        (r"valor\s*total", 90),
-        (r"monto\s*total", 90),
-        (r"total\s*factura", 90),
-        (r"importe\s*total", 90),
-        (r"^\s*total\s*$", 85),
-        (r"^\s*total\s*[:\-]", 85),
+    candidate_patterns = [
+        r"(total\s*a\s*pagar)[^\d$€]{0,30}([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
+        r"(total\s*neto)[^\d$€]{0,30}([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
+        r"(valor\s*total)[^\d$€]{0,30}([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
+        r"(monto\s*total)[^\d$€]{0,30}([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
+        r"(importe\s*total)[^\d$€]{0,30}([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
+        r"(^|\n)\s*(total)\s*[:\-]?\s*([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
     ]
 
-    candidates: List[Tuple[int, int, str, str]] = []
+    for pattern in candidate_patterns:
+        for match in re.finditer(pattern, normalized, flags=re.IGNORECASE | re.MULTILINE):
+            label = match.group(1 if match.lastindex and match.lastindex >= 2 else 0)
+            raw_value = match.group(match.lastindex)
+            window_start = max(0, match.start() - 40)
+            window = normalized[window_start:match.end()].lower()
+            if any(re.search(p, window) for p in IGNORE_LABEL_PATTERNS if p not in label.lower()):
+                # allow if label is the exact priority one; ignore surrounding "subtotal"/"iva"
+                pass
+            value_int = parse_value_from_text(raw_value)
+            if value_int is not None and value_int > 0:
+                return value_int, detect_currency(raw_value), raw_value.strip()
 
-    for i, line in enumerate(lines):
+    # Fallback line-by-line: choose a line with total-like label and not ignored label.
+    for line in normalized.splitlines():
         low = line.lower()
-        for label_pattern, score in same_line_patterns:
-            if re.search(label_pattern, low, re.I):
-                # Do not treat subtotal/IVA/other component rows as TOTAL.
-                if any(re.search(pat, low, re.I) for pat in IGNORE_LABEL_PATTERNS):
-                    # "TOTAL NETO" is explicitly allowed.
-                    if not re.search(r"total\s*neto|total\s*a\s*pagar|valor\s*total|total\s*factura|importe\s*total", low, re.I):
-                        continue
-                vals = extract_invoice_values(line)
-                if vals:
-                    value, currency, literal = max(vals, key=lambda x: x[0])
-                    candidates.append((score, i, literal, currency))
-                    # Keep actual value encoded through a separate lookup below.
-                    candidates[-1] = (score, i, literal, currency)
-
-    if candidates:
-        # Priority by label strength, then prefer a larger explicitly labeled
-        # total only as a tiebreaker.
-        best = sorted(candidates, key=lambda x: (-x[0], x[1]))[0]
-        value = clean_currency_to_int(best[2])
-        return value, detect_currency(best[2]), best[2]
-
-    # 2) Critical fallback: label and amount in adjacent PDF extraction lines.
-    # This is the case for EFFISYSTEMS FE-94506:
-    #   TOTAL NETO
-    #   $100,000
-    # or the amount may be 1-5 lines away because of PDF columns.
-    label_patterns = [
-        (r"total\s*a\s*pagar", 100),
-        (r"total\s*neto", 95),
-        (r"valor\s*total", 90),
-        (r"monto\s*total", 90),
-        (r"total\s*factura", 90),
-        (r"importe\s*total", 90),
-        (r"^\s*total\s*$", 85),
-    ]
-
-    for i, line in enumerate(lines):
-        low = line.lower()
-        label_score = None
-        for pat, score in label_patterns:
-            if re.search(pat, low, re.I):
-                label_score = score
-                break
-        if label_score is None:
-            continue
-
-        # Ignore component labels, but never ignore explicit total-neto /
-        # total-a-pagar rows.
-        if any(re.search(pat, low, re.I) for pat in IGNORE_LABEL_PATTERNS):
-            if not re.search(r"total\s*neto|total\s*a\s*pagar|valor\s*total|total\s*factura|importe\s*total", low, re.I):
-                continue
-
-        for j in range(i + 1, min(len(lines), i + 7)):
-            candidate_line = lines[j]
-            vals = extract_invoice_values(candidate_line)
-            if not vals:
-                # Sometimes the extractor keeps "$" on one line and the number
-                # on the next. Try the combined local window.
-                continue
-
-            # Prefer values that look like money, and reject tiny isolated
-            # quantities such as "1".
-            vals = [v for v in vals if v[0] >= 10]
-            if not vals:
-                continue
-
-            value, currency, literal = max(vals, key=lambda x: x[0])
-            return value, currency, literal
-
-        # Also inspect the same local block as a last resort. This catches
-        # layouts where the total label is followed by several table cells
-        # before the amount.
-        block = "\n".join(lines[i:i+8])
-        vals = [v for v in extract_invoice_values(block) if v[0] >= 10]
-        if vals:
-            value, currency, literal = max(vals, key=lambda x: x[0])
-            return value, currency, literal
+        if any(re.search(p, low) for p in TOTAL_LABEL_PATTERNS) and not any(re.search(p, low) for p in IGNORE_LABEL_PATTERNS):
+            vals = extract_invoice_values(line)
+            if vals:
+                vals.sort(key=lambda x: x[0], reverse=True)
+                return vals[0]
 
     return None
+
 
 def _normalize_invoice_candidate(raw: str) -> str:
     """Normalize an invoice identifier while preserving meaningful prefix/number."""
@@ -891,15 +818,12 @@ def extract_values_from_xml_bytes(xml_bytes: bytes) -> List[Tuple[int, str, str]
         best_candidates.sort(key=lambda x: x[0], reverse=True)
         return [best_candidates[0]]
 
-    # No usar números sueltos del XML como "valor". En facturas DIAN el XML
-    # contiene muchos números (NIT, CUFE, consecutivos, códigos, cantidades,
-    # etc.). Si no encontramos un monto estructurado o un TOTAL etiquetado,
-    # devolvemos vacío para evitar falsos valores como 2840.
     best = find_best_total_by_labels("\n".join(text_blobs))
     if best:
         return [best]
 
-    return []
+    values = extract_invoice_values("\n".join(text_blobs))
+    return [max(values, key=lambda x: x[0])] if values else []
 
 
 def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
@@ -1087,13 +1011,7 @@ def extract_structured_email_invoice_and_supplier(subject: str, body_text: str) 
             if not re.fullmatch(r"[A-Z0-9][A-Z0-9 ._-]{1,30}", candidate, flags=re.I):
                 continue
             invoice = _normalize_invoice_candidate(candidate)
-            # In this explicit NIT;SELLER;INVOICE structure, a numeric
-            # consecutive is valid too (some providers use long numeric
-            # invoice numbers). Do not apply the generic bare-number rejection
-            # here; the field position gives it strong context.
-            if not invoice or len(invoice.replace(" ", "")) > 30:
-                continue
-            if re.fullmatch(r"[A-Z0-9][A-Z0-9 ._-]{1,30}", candidate, flags=re.I) is None:
+            if _is_bad_invoice_candidate(invoice, line):
                 continue
             # A seller should look like a legal/business name or at least not a
             # date/phone/address field.
@@ -1139,40 +1057,44 @@ def extract_invoice_number_from_attachments(msg: email.message.Message) -> str:
 
 
 def extract_best_value_from_attachments(msg: email.message.Message) -> Optional[Tuple[int, str, str]]:
-    """Extract invoice total using labeled PDF evidence or structured XML."""
+    """Return the actual invoice total from the attachments.
+
+    PDF is deliberately checked before XML. In this mailbox there are XML
+    files where auxiliary monetary fields can contain values such as 1000 or
+    2840 even though the rendered invoice shows a different final total.
+    The labelled total printed on the invoice is the source of truth.
+    """
     attachment_files = iter_supported_attachment_files(msg)
-    xml_candidates: List[Tuple[int, str, str]] = []
-    pdf_candidates: List[Tuple[int, str, str]] = []
 
-    # Collect XML candidates without returning immediately.
+    # 1) PDF: trust an explicitly labelled final total first.
     for filename, payload in attachment_files:
-        if filename.lower().endswith(".xml"):
-            vals = extract_values_from_xml_bytes(payload)
-            if vals:
-                xml_candidates.extend(vals)
+        if not filename.lower().endswith(".pdf"):
+            continue
+        text = extract_text_from_pdf_bytes(payload)
+        if not text:
+            continue
+        best = find_best_total_by_labels(text)
+        if best:
+            return best
 
-    # Collect only explicitly labeled totals from PDFs.
+    # 2) XML: fallback only if the PDF has no usable labelled total.
+    for filename, payload in attachment_files:
+        if not filename.lower().endswith(".xml"):
+            continue
+        vals = extract_values_from_xml_bytes(payload)
+        if vals:
+            return max(vals, key=lambda x: x[0])
+
+    # 3) Last resort: any monetary value found in the PDF.
     for filename, payload in attachment_files:
         if filename.lower().endswith(".pdf"):
-            pdf_text = extract_text_from_pdf_bytes(payload)
-            if pdf_text:
-                best = find_best_total_by_labels(pdf_text)
-                if best:
-                    pdf_candidates.append(best)
-
-    # If the PDF explicitly says TOTAL NETO / TOTAL A PAGAR / TOTAL, use
-    # that visible invoice total. This fixes EFFISYSTEMS FE-94506, where the
-    # PDF shows TOTAL NETO $100,000 but an ambiguous XML field can be 1.
-    if pdf_candidates:
-        pdf_candidates.sort(key=lambda x: x[0], reverse=True)
-        return pdf_candidates[0]
-
-    # Otherwise use the structured XML amount.
-    if xml_candidates:
-        xml_candidates.sort(key=lambda x: x[0], reverse=True)
-        return xml_candidates[0]
-
+            text = extract_text_from_pdf_bytes(payload)
+            if text:
+                vals = extract_invoice_values(text)
+                if vals:
+                    return max(vals, key=lambda x: x[0])
     return None
+
 
 def attachments_contain_keyword(msg: email.message.Message) -> Optional[str]:
     for _, text in extract_attachment_texts(msg):
@@ -1588,36 +1510,27 @@ def _scan_and_store(
 
             # The invoice document is the source of truth. Prefer XML/PDF
             # over the email subject/body because email templates vary by sender.
-            attachment_names = [name for name, _payload in iter_supported_attachment_files(msg)]
-            # Some forwarding systems include a highly reliable structured
-            # record in the email body/subject: NIT;PROVEEDOR;FACTURA;...
-            # When present, this structured seller/consecutive pair takes
-            # priority over the PDF/XML extraction because it is already the
-            # normalized DIAN forwarding data used by the sender.
+            invoice_number = extract_invoice_number_from_attachments(msg)
+            supplier_name = extract_supplier_name_from_attachments(msg)
+
+            # If the attachment is missing/unreadable, many forwarding systems
+            # put NIT;SELLER;INVOICE in the subject. Use that before generic
+            # email-text heuristics or the sender address.
             structured_invoice, structured_supplier = extract_structured_email_invoice_and_supplier(
                 subject, body_text
             )
-
-            attachment_names = [name for name, _payload in iter_supported_attachment_files(msg)]
-            invoice_number = structured_invoice or extract_invoice_number_from_attachments(msg)
-            supplier_name = structured_supplier or extract_supplier_name_from_attachments(msg)
-            logging.info(
-                "DIAGNOSTICO ADJUNTOS | uid=%s | archivos=%s | factura_doc=%s | proveedor_doc=%s | estructurado=%s",
-                uid, attachment_names, invoice_number or "VACIO", supplier_name or "VACIO",
-                "SI" if structured_invoice or structured_supplier else "NO",
-            )
+            if not invoice_number and structured_invoice:
+                invoice_number = structured_invoice
+            if not supplier_name and structured_supplier:
+                supplier_name = structured_supplier
 
             if not invoice_number:
                 invoice_number = extract_invoice_number(haystack)
-                if invoice_number:
-                    logging.info("DIAGNOSTICO FACTURA | fuente=email | factura=%s", invoice_number)
             if not supplier_name:
                 supplier_name = extract_supplier_name_from_email_text(subject, body_text)
-                if supplier_name:
-                    logging.info("DIAGNOSTICO PROVEEDOR | fuente=email_estructurado | proveedor=%s", supplier_name)
             if not supplier_name:
                 supplier_name = _supplier_name(from_real)
-                logging.info("DIAGNOSTICO PROVEEDOR | fuente=remitente | proveedor=%s", supplier_name)
+                logging.info("Proveedor por remitente (fallback): %s | asunto=%s", supplier_name, subject)
 
             # The document is the source of truth for the amount too. Prefer
             # XML/PDF TOTAL/PayableAmount over the email body, because email
@@ -1628,20 +1541,19 @@ def _scan_and_store(
             if best_value is None:
                 best_value = find_best_total_by_labels(haystack)
 
-            if best_value is None:
+            if best_value is not None:
                 logging.info(
-                    "DIAGNOSTICO VALOR | uid=%s | valor=VACIO | motivo=sin_total_etiquetado",
-                    uid,
+                    "DIAGNOSTICO VALOR | uid=%s | valor=%s | moneda=%s | literal=%s",
+                    uid, best_value[0], best_value[1], best_value[2]
                 )
-                continue
+                selected_values = [best_value]
+            else:
+                values = extract_invoice_values(haystack)
+                if not values:
+                    continue
+                selected_values = [max(values, key=lambda x: x[0])]
 
-            value_int, currency, literal = best_value
-            logging.info(
-                "DIAGNOSTICO VALOR | uid=%s | valor=%s | moneda=%s | literal=%r",
-                uid, value_int, currency, literal,
-            )
-
-            for value_int, currency, _literal in [best_value]:
+            for value_int, currency, _literal in selected_values:
                 rec = InvoiceRecord(
                     message_id=message_id,
                     uid=uid,
