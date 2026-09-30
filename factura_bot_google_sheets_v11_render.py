@@ -1057,42 +1057,67 @@ def extract_invoice_number_from_attachments(msg: email.message.Message) -> str:
 
 
 def extract_best_value_from_attachments(msg: email.message.Message) -> Optional[Tuple[int, str, str]]:
-    """Return the actual invoice total from the attachments.
+    """
+    Obtiene el valor real de la factura.
 
-    PDF is deliberately checked before XML. In this mailbox there are XML
-    files where auxiliary monetary fields can contain values such as 1000 or
-    2840 even though the rendered invoice shows a different final total.
-    The labelled total printed on the invoice is the source of truth.
+    IMPORTANTE:
+    Para facturas DIAN heterogéneas, el PDF visible es la fuente principal
+    para el TOTAL. Algunos XML de proveedores pueden contener importes
+    auxiliares/incorrectamente mapeados (por ejemplo 1 o 1000), mientras que
+    el PDF muestra claramente TOTAL NETO / TOTAL A PAGAR.
+
+    Prioridad:
+      1. PDF: TOTAL NETO / TOTAL A PAGAR / VALOR TOTAL.
+      2. XML: PayableAmount / TaxInclusiveAmount.
+      3. PDF/XML: cualquier importe como último respaldo.
     """
     attachment_files = iter_supported_attachment_files(msg)
 
-    # 1) PDF: trust an explicitly labelled final total first.
+    # 1) PDF primero: buscar explícitamente el total visible.
     for filename, payload in attachment_files:
         if not filename.lower().endswith(".pdf"):
             continue
         text = extract_text_from_pdf_bytes(payload)
         if not text:
             continue
+
         best = find_best_total_by_labels(text)
         if best:
+            logging.info(
+                "VALOR DESDE PDF | archivo=%s | valor=%s | moneda=%s | literal=%s",
+                filename, best[0], best[1], best[2]
+            )
             return best
 
-    # 2) XML: fallback only if the PDF has no usable labelled total.
+    # 2) XML solamente si el PDF no permitió encontrar un total etiquetado.
     for filename, payload in attachment_files:
         if not filename.lower().endswith(".xml"):
             continue
         vals = extract_values_from_xml_bytes(payload)
         if vals:
-            return max(vals, key=lambda x: x[0])
+            best = max(vals, key=lambda x: x[0])
+            logging.info(
+                "VALOR DESDE XML | archivo=%s | valor=%s | moneda=%s | literal=%s",
+                filename, best[0], best[1], best[2]
+            )
+            return best
 
-    # 3) Last resort: any monetary value found in the PDF.
+    # 3) Último respaldo: importes detectados en PDF.
     for filename, payload in attachment_files:
-        if filename.lower().endswith(".pdf"):
-            text = extract_text_from_pdf_bytes(payload)
-            if text:
-                vals = extract_invoice_values(text)
-                if vals:
-                    return max(vals, key=lambda x: x[0])
+        if not filename.lower().endswith(".pdf"):
+            continue
+        text = extract_text_from_pdf_bytes(payload)
+        if not text:
+            continue
+        vals = extract_invoice_values(text)
+        if vals:
+            best = max(vals, key=lambda x: x[0])
+            logging.info(
+                "VALOR RESPALDO PDF | archivo=%s | valor=%s | moneda=%s | literal=%s",
+                filename, best[0], best[1], best[2]
+            )
+            return best
+
     return None
 
 
@@ -1542,10 +1567,6 @@ def _scan_and_store(
                 best_value = find_best_total_by_labels(haystack)
 
             if best_value is not None:
-                logging.info(
-                    "DIAGNOSTICO VALOR | uid=%s | valor=%s | moneda=%s | literal=%s",
-                    uid, best_value[0], best_value[1], best_value[2]
-                )
                 selected_values = [best_value]
             else:
                 values = extract_invoice_values(haystack)
