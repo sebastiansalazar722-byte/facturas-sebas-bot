@@ -14,6 +14,7 @@ Uso:
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import email
 import imaplib
@@ -1274,9 +1275,18 @@ def process_mail_once(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
 ) -> dict:
-    if start_date and end_date:
+    """Process mail, using small batches for historical ranges to control RAM.
+
+    Historical runs are deliberately single-pass and synchronized to Sheets after
+    every batch. Daily/scheduler runs keep the existing second verification.
+    """
+    historical_range = bool(start_date and end_date)
+
+    if historical_range:
         start_dt, end_dt, stored_date = build_custom_range_local(start_date, end_date)
         logging.info("Iniciando proceso para rango %s - %s", start_date, end_date)
+        # A historical rebuild must not run the expensive second pass.
+        recheck = False
     else:
         now = datetime.now().astimezone()
         stored_date = now.strftime("%Y-%m-%d")
@@ -1291,22 +1301,50 @@ def process_mail_once(
     with connect_imap(cfg) as mail:
         ids = search_candidates(mail, start_dt, end_dt)
         candidate_messages = len(ids)
-        inserted_first_pass, skipped_excluded = _scan_and_store(
-            mail=mail,
-            ids=ids,
-            db_path=DB_PATH,
-            stored_date=stored_date,
-            start_dt=start_dt,
-            end_dt=end_dt,
-            cfg=cfg,
-        )
 
-        if recheck:
-            logging.info("Ejecutando segunda verificación del filtro...")
-            ids_again = search_candidates(mail, start_dt, end_dt)
-            inserted_second_pass, _ = _scan_and_store(
+        if historical_range:
+            batch_size = 25
+            batches = [ids[i:i + batch_size] for i in range(0, len(ids), batch_size)]
+            total_batches = len(batches)
+            logging.info(
+                "Mensajes candidatos: %s | procesamiento por lotes de %s",
+                candidate_messages, batch_size
+            )
+
+            for batch_no, batch_ids in enumerate(batches, start=1):
+                logging.info(
+                    "Procesando lote %s/%s (%s mensajes)...",
+                    batch_no, total_batches, len(batch_ids)
+                )
+                batch_inserted, batch_skipped = _scan_and_store(
+                    mail=mail,
+                    ids=batch_ids,
+                    db_path=DB_PATH,
+                    stored_date=stored_date,
+                    start_dt=start_dt,
+                    end_dt=end_dt,
+                    cfg=cfg,
+                )
+                inserted_first_pass += batch_inserted
+                skipped_excluded += batch_skipped
+
+                # Sync after every batch so progress is preserved even if a later
+                # batch exhausts the memory available to the Render job.
+                try:
+                    all_records = get_all_stored_invoices(DB_PATH)
+                    batch_sheets_result = sync_to_google_sheets(cfg, all_records)
+                    logging.info("Lote %s/%s sincronizado: %s", batch_no, total_batches, batch_sheets_result)
+                except Exception as exc:
+                    logging.exception(
+                        "No fue posible sincronizar Google Sheets en lote %s/%s: %s",
+                        batch_no, total_batches, exc
+                    )
+
+                gc.collect()
+        else:
+            inserted_first_pass, skipped_excluded = _scan_and_store(
                 mail=mail,
-                ids=ids_again,
+                ids=ids,
                 db_path=DB_PATH,
                 stored_date=stored_date,
                 start_dt=start_dt,
@@ -1314,14 +1352,26 @@ def process_mail_once(
                 cfg=cfg,
             )
 
+            if recheck:
+                logging.info("Ejecutando segunda verificación del filtro...")
+                ids_again = search_candidates(mail, start_dt, end_dt)
+                inserted_second_pass, _ = _scan_and_store(
+                    mail=mail,
+                    ids=ids_again,
+                    db_path=DB_PATH,
+                    stored_date=stored_date,
+                    start_dt=start_dt,
+                    end_dt=end_dt,
+                    cfg=cfg,
+                )
+
     stored_records = get_stored_invoices(DB_PATH, stored_date)
     total_count = len(stored_records)
     total_sum = sum(r.valor_entero for r in stored_records)
 
+    # Final sync also rebuilds the monthly analysis from the complete DB history.
     sheets_result = {"enabled": False, "inserted": 0}
     try:
-        # Sync the complete SQLite history, not only today's records, so the
-        # monthly analysis can be rebuilt consistently after every run.
         all_records = get_all_stored_invoices(DB_PATH)
         sheets_result = sync_to_google_sheets(cfg, all_records)
     except Exception as exc:
