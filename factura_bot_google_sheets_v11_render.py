@@ -31,6 +31,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 from contextlib import closing
 from dataclasses import dataclass
+from decimal import Decimal
 from datetime import datetime, timedelta
 from email.header import decode_header, make_header
 from email.message import EmailMessage
@@ -1344,9 +1345,27 @@ def extract_best_value_from_attachments(msg: email.message.Message) -> Optional[
                 if best:
                     pdf_candidates.append(best)
 
-    # If the PDF explicitly says TOTAL NETO / TOTAL A PAGAR / TOTAL, use
-    # that visible invoice total. This fixes EFFISYSTEMS FE-94506, where the
-    # PDF shows TOTAL NETO $100,000 but an ambiguous XML field can be 1.
+    # EFFISYSTEMS: when the XML contains the structured invoice total,
+    # prefer it over the PDF text extraction. This avoids the PDF extractor
+    # accidentally interpreting a nearby quantity such as 1,000 as the total.
+    # The XML parser above is deliberately strict: it only accepts
+    # LegalMonetaryTotal/PayableAmount or TaxInclusiveAmount (or a direct
+    # PayableAmount fallback), so it does not reuse arbitrary XML quantities.
+    for filename, payload in attachment_files:
+        if not filename.lower().endswith(".xml"):
+            continue
+        supplier_xml = extract_supplier_name_from_xml_bytes(payload)
+        if "EFFISYSTEMS" in (supplier_xml or "").upper() and xml_candidates:
+            xml_candidates.sort(key=lambda x: x[0], reverse=True)
+            chosen = xml_candidates[0]
+            logging.info(
+                "DIAGNOSTICO VALOR EFFI | proveedor=%s | fuente=XML_ESTRUCTURADO | valor=%s | literal=%r",
+                supplier_xml, chosen[0], chosen[2],
+            )
+            return chosen
+
+    # For the rest of suppliers, preserve the existing behavior: an explicit
+    # TOTAL NETO / TOTAL A PAGAR / TOTAL in the PDF has priority.
     if pdf_candidates:
         pdf_candidates.sort(key=lambda x: x[0], reverse=True)
         return pdf_candidates[0]
