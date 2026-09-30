@@ -14,7 +14,6 @@ Uso:
 from __future__ import annotations
 
 import argparse
-import gc
 import hashlib
 import email
 import imaplib
@@ -1289,67 +1288,20 @@ def process_mail_once(
     skipped_excluded = 0
     candidate_messages = 0
 
-    # Historical rebuilds can contain hundreds of PDF/XML attachments.
-    # Process them in small batches so a 512 MB Render instance does not
-    # accumulate parsed email/PDF objects until the very end. Each batch is
-    # persisted and synced to Sheets before moving on to the next one.
-    batch_size = 25 if (start_date and end_date) else 50
-
     with connect_imap(cfg) as mail:
         ids = search_candidates(mail, start_dt, end_dt)
         candidate_messages = len(ids)
-        logging.info(
-            "Mensajes candidatos: %s | procesamiento por lotes de %s",
-            candidate_messages, batch_size,
+        inserted_first_pass, skipped_excluded = _scan_and_store(
+            mail=mail,
+            ids=ids,
+            db_path=DB_PATH,
+            stored_date=stored_date,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            cfg=cfg,
         )
 
-        for batch_start in range(0, len(ids), batch_size):
-            batch = ids[batch_start:batch_start + batch_size]
-            batch_number = batch_start // batch_size + 1
-            total_batches = (len(ids) + batch_size - 1) // batch_size
-            logging.info(
-                "Procesando lote %s/%s (%s mensajes)...",
-                batch_number, total_batches, len(batch),
-            )
-
-            batch_inserted, batch_skipped = _scan_and_store(
-                mail=mail,
-                ids=batch,
-                db_path=DB_PATH,
-                stored_date=stored_date,
-                start_dt=start_dt,
-                end_dt=end_dt,
-                cfg=cfg,
-            )
-            inserted_first_pass += batch_inserted
-            skipped_excluded += batch_skipped
-
-            # Release the batch's message/attachment objects before the next
-            # batch. gc.collect() is intentional here because PDF parsers can
-            # retain cyclic references for a while.
-            del batch
-            gc.collect()
-
-            # For historical/custom ranges, the first pass is enough. The old
-            # second pass doubled the amount of PDF/XML work and was a major
-            # source of memory pressure. Normal daily runs keep recheck=True.
-            if cfg.google_sheets_enabled:
-                try:
-                    batch_records = get_all_stored_invoices(DB_PATH)
-                    sync_result = sync_to_google_sheets(cfg, batch_records)
-                    logging.info(
-                        "Lote %s/%s sincronizado: %s",
-                        batch_number, total_batches, sync_result,
-                    )
-                    del batch_records
-                except Exception as exc:
-                    logging.exception(
-                        "No fue posible sincronizar Google Sheets tras el lote %s: %s",
-                        batch_number, exc,
-                    )
-                gc.collect()
-
-        if recheck and not (start_date and end_date):
+        if recheck:
             logging.info("Ejecutando segunda verificación del filtro...")
             ids_again = search_candidates(mail, start_dt, end_dt)
             inserted_second_pass, _ = _scan_and_store(
@@ -1361,8 +1313,6 @@ def process_mail_once(
                 end_dt=end_dt,
                 cfg=cfg,
             )
-            del ids_again
-            gc.collect()
 
     stored_records = get_stored_invoices(DB_PATH, stored_date)
     total_count = len(stored_records)
@@ -1833,12 +1783,9 @@ def main() -> int:
             raise ValueError("Debes usar --start-date y --end-date juntos.")
 
         if args.run_now:
-            # Custom historical ranges are processed in a single pass.
-            # Daily runs retain the original second verification.
-            historical_range = bool(args.start_date and args.end_date)
             result = process_mail_once(
                 cfg,
-                recheck=not historical_range,
+                recheck=True,
                 start_date=args.start_date,
                 end_date=args.end_date,
             )
