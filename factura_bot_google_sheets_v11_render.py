@@ -523,14 +523,39 @@ def find_best_total_by_labels(text: str) -> Optional[Tuple[int, str, str]]:
             if value_int is not None and value_int > 0:
                 return value_int, detect_currency(raw_value), raw_value.strip()
 
-    # Fallback line-by-line: choose a line with total-like label and not ignored label.
-    for line in normalized.splitlines():
+    # Strong fallback for PDFs where the label and amount are split across
+    # columns/lines (common in invoice tables). Prefer exact total labels and
+    # explicitly reject quantity/count labels such as "Total items: 1".
+    lines = [normalize_spaces(x) for x in normalized.splitlines() if normalize_spaces(x)]
+    strong_total_re = re.compile(r"\b(total\s+neto|total\s+a\s+pagar|total\s+factura|valor\s+total|importe\s+total|monto\s+total)\b", re.I)
+    weak_total_re = re.compile(r"^\s*total\s*[:\-]?\s*([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)\s*$", re.I)
+    bad_quantity_re = re.compile(r"\btotal\s+(?:items?|unidades?|cantidad(?:es)?|productos?|art[ií]culos?)\b", re.I)
+
+    for idx, line in enumerate(lines):
         low = line.lower()
-        if any(re.search(p, low) for p in TOTAL_LABEL_PATTERNS) and not any(re.search(p, low) for p in IGNORE_LABEL_PATTERNS):
+        if bad_quantity_re.search(low):
+            continue
+        if strong_total_re.search(line):
+            # First try amount on the same line.
             vals = extract_invoice_values(line)
             if vals:
                 vals.sort(key=lambda x: x[0], reverse=True)
                 return vals[0]
+            # Then inspect the next 3 lines; PDF text extraction frequently
+            # separates the label from the amount.
+            for nxt in lines[idx + 1: idx + 4]:
+                if bad_quantity_re.search(nxt.lower()):
+                    continue
+                vals = extract_invoice_values(nxt)
+                if vals:
+                    vals.sort(key=lambda x: x[0], reverse=True)
+                    return vals[0]
+
+        m = weak_total_re.search(line)
+        if m and not bad_quantity_re.search(low):
+            value_int = parse_value_from_text(m.group(1))
+            if value_int and value_int > 1:
+                return value_int, detect_currency(m.group(1)), m.group(1).strip()
 
     return None
 
