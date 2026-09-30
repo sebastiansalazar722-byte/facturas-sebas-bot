@@ -14,6 +14,7 @@ Uso:
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import email
 import imaplib
@@ -633,6 +634,60 @@ def extract_invoice_number(text: str) -> str:
             if not _is_bad_invoice_candidate(candidate, line):
                 return candidate
 
+    # 2b) Some layouts separate the prefix and number, e.g.
+    # "No. 2586" with "FEEM" elsewhere in the invoice header.
+    # Pair a nearby invoice prefix with a nearby No./Número value, while
+    # explicitly avoiding DIAN authorization ranges.
+    prefix_matches = list(re.finditer(r"\b((?:FEVP|FEPI|FEEM|FEA|FE|FVE|FV|FCME|FC|EC|CNFE|PV|AR|YA)[A-Z]?)\b", normalized, flags=re.I))
+    no_matches = list(re.finditer(r"\b(?:no\.?|n[úu]mero|numero)\s*[:#]?\s*(\d{1,20})\b", normalized, flags=re.I))
+    pair_candidates = []
+    for pm in prefix_matches:
+        for nm in no_matches:
+            distance = abs(pm.start() - nm.start())
+            if distance > 700:
+                continue
+            window = normalized[max(0, min(pm.start(), nm.start())-120):min(len(normalized), max(pm.end(), nm.end())+120)]
+            low = window.lower()
+            if any(x in low for x in ("autorización", "autorizacion", "habilita desde", "rango")):
+                continue
+            candidate = _normalize_invoice_candidate(f"{pm.group(1)} {nm.group(1)}")
+            if _is_bad_invoice_candidate(candidate, window):
+                continue
+            # Prefer pairs where the prefix and No. are close and the context
+            # contains invoice terminology.
+            score = (5 if "factura" in low else 0) + (3 if "venta" in low else 0) - distance / 1000
+            pair_candidates.append((score, -distance, candidate))
+    if pair_candidates:
+        pair_candidates.sort(reverse=True)
+        return pair_candidates[0][2]
+
+
+    # 2c) Another common layout puts the numeric consecutive immediately
+    # before the seller name, while the FE prefix appears elsewhere in the
+    # header (for example: "2586 / INTERCOMERCIO JAO SAS / ... / FEEM").
+    for idx, line in enumerate(lines):
+        if not re.search(r"\b(?:SAS|S\.?A\.?S\.?|LTDA|LIMITADA|S\.?A\.?)\b", line, flags=re.I):
+            continue
+        if idx == 0:
+            continue
+        prev = lines[idx-1]
+        nm = re.fullmatch(r"(\d{1,20})", prev.strip())
+        if not nm:
+            continue
+        candidate_number = nm.group(1)
+        if len(candidate_number) > 20:
+            continue
+        # Prefer an isolated FE-style prefix elsewhere in the document.
+        # Ignore prefixes occurring on authorization/range lines.
+        prefix_lines = []
+        for pidx, pline in enumerate(lines):
+            mpre = re.fullmatch(r"((?:FEVP|FEPI|FEEM|FEA|FE|FVE|FV|FCME|FC|EC|CNFE|PV|AR|YA)[A-Z]?)", pline, flags=re.I)
+            if mpre and not re.search(r"autoriz|habilita|rango|hasta", pline, flags=re.I):
+                prefix_lines.append((abs(pidx-idx), mpre.group(1)))
+        if prefix_lines:
+            prefix_lines.sort(key=lambda x: x[0])
+            return _normalize_invoice_candidate(f"{prefix_lines[0][1]} {candidate_number}")
+
     # 3) Search for invoice-like prefixes, but only when the token is near
     # invoice terminology. This prevents selecting random FE*/code tokens.
     prefix_pattern = re.compile(
@@ -772,6 +827,20 @@ def extract_values_from_xml_bytes(xml_bytes: bytes) -> List[Tuple[int, str, str]
 
 
 def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
+    # PyMuPDF usually preserves the invoice header/layout better than pypdf.
+    try:
+        import fitz
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            texts = [page.get_text() or "" for page in doc]
+            text = "\n".join(x for x in texts if x.strip())
+            if text.strip():
+                return "\n".join(normalize_spaces(line) for line in text.splitlines() if normalize_spaces(line))
+        finally:
+            doc.close()
+    except Exception:
+        pass
+
     try:
         with tempfile.NamedTemporaryFile(delete=True, suffix=".pdf") as tmp:
             tmp.write(pdf_bytes)
@@ -782,7 +851,7 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
                 page_text = page.extract_text() or ""
                 if page_text.strip():
                     texts.append(page_text)
-            return normalize_spaces("\n".join(texts))
+            return "\n".join(normalize_spaces(line) for line in "\n".join(texts).splitlines() if normalize_spaces(line))
     except Exception:
         return ""
 
@@ -827,6 +896,105 @@ def extract_attachment_texts(msg: email.message.Message) -> List[Tuple[str, str]
             extracted.append((filename, normalize_spaces(text)))
     return extracted
 
+
+
+def _clean_supplier_name(value: str) -> str:
+    value = normalize_spaces(value or "")
+    value = re.sub(r"\s*<[^>]+>\s*", " ", value)
+    value = re.sub(r"^(?:raz[oó]n\s+social|proveedor|vendedor|emisor|empresa)\s*[:#-]?\s*", "", value, flags=re.I)
+    return normalize_spaces(value).strip(" -:|;")
+
+
+def _looks_like_technical_provider(name: str) -> bool:
+    low = normalize_spaces(name).lower()
+    technical = (
+        "ateb", "cofidi", "siesa", "world office", "worldoffice",
+        "siigo", "facturatech", "the factory hka", "hka", "edigital",
+        "proveedor tecnologico", "proveedor tecnológico", "software"
+    )
+    return any(x in low for x in technical)
+
+
+def extract_supplier_name_from_xml_bytes(xml_bytes: bytes) -> str:
+    try:
+        root = ET.fromstring(xml_bytes)
+    except Exception:
+        return ""
+    for supplier in root.iter():
+        if supplier.tag.split("}")[-1].lower() != "accountingsupplierparty":
+            continue
+        candidates = []
+        for elem in supplier.iter():
+            tag = elem.tag.split("}")[-1].lower()
+            if tag in ("registrationname", "name"):
+                value = _clean_supplier_name(elem.text or "")
+                if value and not _looks_like_technical_provider(value):
+                    candidates.append((0 if tag == "registrationname" else 1, value))
+        if candidates:
+            candidates.sort(key=lambda x: x[0])
+            return candidates[0][1]
+    return ""
+
+
+def extract_supplier_name_from_text(text: str) -> str:
+    if not text:
+        return ""
+    lines = [normalize_spaces(x) for x in text.replace("\r", "\n").splitlines() if normalize_spaces(x)]
+    candidates = []
+    label_patterns = [
+        r"(?:raz[oó]n\s+social|nombre\s+del\s+emisor|emisor|proveedor|vendedor|empresa)\s*[:#-]\s*(.+)$",
+    ]
+    for idx, line in enumerate(lines):
+        for pat in label_patterns:
+            m = re.search(pat, line, flags=re.I)
+            if m:
+                val = _clean_supplier_name(m.group(1))
+                if len(val) >= 3 and not _looks_like_technical_provider(val):
+                    candidates.append((8, val))
+        # In many PDFs the seller name is immediately above the invoice title.
+        if idx < 30 and re.search(r"factura\s+(?:electr[oó]nica\s+)?(?:de\s+venta)?", line, re.I):
+            for prev in lines[max(0, idx-8):idx]:
+                val = _clean_supplier_name(prev)
+                if (len(val) >= 5 and not re.search(r"^(factura|nit|fecha|cliente|se[nñ]or|se[nñ]ores)\b", val, re.I)
+                        and not _looks_like_technical_provider(val) and not re.search(r"\d{6,}", val)):
+                    candidates.append((4, val))
+
+        # Common DIAN PDF layout: company name followed by a line containing
+        # "Nit". This is a strong seller signal and avoids the technical
+        # provider that may appear elsewhere in the document.
+        if idx + 1 < len(lines) and re.fullmatch(r"nit\.?", lines[idx+1], flags=re.I):
+            val = _clean_supplier_name(line)
+            if (len(val) >= 5 and not _looks_like_technical_provider(val)
+                    and not re.search(r"^(factura|cliente|vendedor|direcci[oó]n|fecha)\b", val, re.I)
+                    and not re.search(r"\d{6,}", val)):
+                candidates.append((10, val))
+    # A legal seller name commonly contains SAS/LTDA and is much stronger
+    # evidence than labels such as DIRECCIÓN, NIT or FECHA.
+    for line in lines[:60]:
+        val = _clean_supplier_name(line)
+        if (re.search(r"\b(?:SAS|S\.?A\.?S\.?|LTDA|LIMITADA|S\.?A\.)\b", val, flags=re.I)
+                and len(val) >= 5 and not _looks_like_technical_provider(val)
+                and not re.search(r"\d{6,}", val)):
+            candidates.append((12, val))
+
+    if candidates:
+        candidates.sort(key=lambda x: (-x[0], x[1]))
+        return candidates[0][1]
+    return ""
+
+
+def extract_supplier_name_from_attachments(msg: email.message.Message) -> str:
+    for filename, payload in iter_supported_attachment_files(msg):
+        if filename.lower().endswith(".xml"):
+            name = extract_supplier_name_from_xml_bytes(payload)
+            if name:
+                return name
+    for filename, payload in iter_supported_attachment_files(msg):
+        if filename.lower().endswith(".pdf"):
+            name = extract_supplier_name_from_text(extract_text_from_pdf_bytes(payload))
+            if name:
+                return name
+    return ""
 
 def extract_invoice_number_from_attachments(msg: email.message.Message) -> str:
     # XML has priority because it contains the structured DIAN document ID.
@@ -1121,20 +1289,67 @@ def process_mail_once(
     skipped_excluded = 0
     candidate_messages = 0
 
+    # Historical rebuilds can contain hundreds of PDF/XML attachments.
+    # Process them in small batches so a 512 MB Render instance does not
+    # accumulate parsed email/PDF objects until the very end. Each batch is
+    # persisted and synced to Sheets before moving on to the next one.
+    batch_size = 25 if (start_date and end_date) else 50
+
     with connect_imap(cfg) as mail:
         ids = search_candidates(mail, start_dt, end_dt)
         candidate_messages = len(ids)
-        inserted_first_pass, skipped_excluded = _scan_and_store(
-            mail=mail,
-            ids=ids,
-            db_path=DB_PATH,
-            stored_date=stored_date,
-            start_dt=start_dt,
-            end_dt=end_dt,
-            cfg=cfg,
+        logging.info(
+            "Mensajes candidatos: %s | procesamiento por lotes de %s",
+            candidate_messages, batch_size,
         )
 
-        if recheck:
+        for batch_start in range(0, len(ids), batch_size):
+            batch = ids[batch_start:batch_start + batch_size]
+            batch_number = batch_start // batch_size + 1
+            total_batches = (len(ids) + batch_size - 1) // batch_size
+            logging.info(
+                "Procesando lote %s/%s (%s mensajes)...",
+                batch_number, total_batches, len(batch),
+            )
+
+            batch_inserted, batch_skipped = _scan_and_store(
+                mail=mail,
+                ids=batch,
+                db_path=DB_PATH,
+                stored_date=stored_date,
+                start_dt=start_dt,
+                end_dt=end_dt,
+                cfg=cfg,
+            )
+            inserted_first_pass += batch_inserted
+            skipped_excluded += batch_skipped
+
+            # Release the batch's message/attachment objects before the next
+            # batch. gc.collect() is intentional here because PDF parsers can
+            # retain cyclic references for a while.
+            del batch
+            gc.collect()
+
+            # For historical/custom ranges, the first pass is enough. The old
+            # second pass doubled the amount of PDF/XML work and was a major
+            # source of memory pressure. Normal daily runs keep recheck=True.
+            if cfg.google_sheets_enabled:
+                try:
+                    batch_records = get_all_stored_invoices(DB_PATH)
+                    sync_result = sync_to_google_sheets(cfg, batch_records)
+                    logging.info(
+                        "Lote %s/%s sincronizado: %s",
+                        batch_number, total_batches, sync_result,
+                    )
+                    del batch_records
+                except Exception as exc:
+                    logging.exception(
+                        "No fue posible sincronizar Google Sheets tras el lote %s: %s",
+                        batch_number, exc,
+                    )
+                gc.collect()
+
+        if recheck and not (start_date and end_date):
             logging.info("Ejecutando segunda verificación del filtro...")
             ids_again = search_candidates(mail, start_dt, end_dt)
             inserted_second_pass, _ = _scan_and_store(
@@ -1146,6 +1361,8 @@ def process_mail_once(
                 end_dt=end_dt,
                 cfg=cfg,
             )
+            del ids_again
+            gc.collect()
 
     stored_records = get_stored_invoices(DB_PATH, stored_date)
     total_count = len(stored_records)
@@ -1238,6 +1455,11 @@ def _scan_and_store(
             if not invoice_number:
                 invoice_number = extract_invoice_number(haystack)
 
+            # El proveedor se intenta obtener del documento, no del software remitente.
+            supplier_name = extract_supplier_name_from_attachments(msg)
+            if not supplier_name:
+                supplier_name = _supplier_name(from_real)
+
             # Prioridad: valor etiquetado en texto -> adjunto -> fallback números
             best_value = find_best_total_by_labels(haystack)
             if best_value is None:
@@ -1263,7 +1485,7 @@ def _scan_and_store(
                     email_date=msg_date.strftime("%a, %d %b %Y %H:%M:%S %z"),
                     stored_date=stored_date,
                     remitente_fijo=FIXED_SENDER_NAME,
-                    remitente_real=from_real,
+                    remitente_real=supplier_name or from_real,
                     asunto=subject,
                     valor_entero=value_int,
                     moneda=currency,
@@ -1611,9 +1833,12 @@ def main() -> int:
             raise ValueError("Debes usar --start-date y --end-date juntos.")
 
         if args.run_now:
+            # Custom historical ranges are processed in a single pass.
+            # Daily runs retain the original second verification.
+            historical_range = bool(args.start_date and args.end_date)
             result = process_mail_once(
                 cfg,
-                recheck=True,
+                recheck=not historical_range,
                 start_date=args.start_date,
                 end_date=args.end_date,
             )
