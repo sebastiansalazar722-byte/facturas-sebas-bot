@@ -426,7 +426,7 @@ def corrida_diaria(bot, monkeypatch, tmp_path, sheets_falso):
     monkeypatch.setattr(bot, "send_summary_email", lambda *a, **k: None)
     contador = {"n": 0}
 
-    def _correr(crudos, ahora):
+    def _correr(crudos, ahora, **opciones):
         contador["n"] += 1
         db = tmp_path / f"corrida_{contador['n']}.db"
         bot.init_db(db)
@@ -439,7 +439,7 @@ def corrida_diaria(bot, monkeypatch, tmp_path, sheets_falso):
 
         monkeypatch.setattr(bot, "datetime", FechaFija)
         monkeypatch.setattr(bot, "connect_imap", lambda _cfg: ImapFalso(crudos))
-        return bot.process_mail_once(cfg, recheck=True)
+        return bot.process_mail_once(cfg, recheck=True, **opciones)
 
     return _correr, hoja1
 
@@ -470,3 +470,213 @@ def test_corrida_diaria_no_recoge_correos_de_anteayer(corrida_diaria):
     resultado = correr([crudo], datetime(2026, 9, 10, 1, 0, tzinfo=timezone.utc))
     assert resultado["inserted_first_pass"] == 0
     assert [f[2] for f in hoja1.filas] == ["Factura", "FE 1"]
+
+
+# =============================================================================
+# Arreglos de la auditoría (antes eran bugs conocidos en test_bugs_conocidos.py)
+# =============================================================================
+
+# -------------------------------------------------------------------- proveedor
+PDF_RELLENOS = """RELLENOS Y FIBRAS
+LUZ EDIT GIL DUQUE
+NIT 43048845-1
+FACTURA ELECTRÓNICA DE VENTA FE 10647
+Cliente
+SEBAS DUNCAN SAS
+NIT 901234567
+TOTAL A PAGAR 1.230.000"""
+
+
+def test_proveedor_del_pdf_no_es_el_comprador(bot):
+    assert "SEBAS DUNCAN" not in bot.extract_supplier_name_from_text(PDF_RELLENOS).upper()
+
+
+def test_proveedor_del_pdf_no_depende_del_orden_alfabetico(bot):
+    texto = PDF_RELLENOS.replace("RELLENOS Y FIBRAS\nLUZ EDIT GIL DUQUE", "TEXTIFILH SAS")
+    assert bot.extract_supplier_name_from_text(texto) == "TEXTIFILH SAS"
+
+
+@pytest.mark.parametrize("nombre", [
+    "SEBAS DUNCAN SAS", "Sebas Duncan sas", "SEBAS DUNCAN S.A.S",
+    "SEBAS DUNCAN SAS . FECHA DE EXPEDICIÓN : 2026/09/18 11:48:45",
+])
+def test_el_comprador_nunca_es_proveedor(bot, nombre):
+    assert bot._is_own_company(nombre)
+    assert bot.extract_supplier_name_from_text("FACTURA\n" + nombre) == ""
+
+
+def test_razon_social_de_proveedor_tecnico(bot):
+    assert bot._looks_like_technical_provider("Sistemas de Informacion Empresarial S.A.S.")
+
+
+def test_attached_document_proveedor(bot):
+    assert bot.extract_supplier_name_from_xml_bytes(xml_attached(proveedor="EFFISYSTEMS S.A.S.")) == "EFFISYSTEMS S.A.S."
+
+
+def test_flujo_proveedor_del_asunto_gana_sobre_el_pdf(bot, escanear, monkeypatch):
+    """Sin XML: el proveedor del asunto estructurado manda sobre lo que se lea del PDF."""
+    monkeypatch.setattr(bot, "extract_text_from_pdf_bytes", lambda _b: "ALMACENES OTRO NOMBRE SAS\nTOTAL A PAGAR 468.000")
+    _, _, filas = escanear([correo(PLASTISOL, adjuntos=[("fv.pdf", b"%PDF-falso")])])
+    assert filas[0]["proveedor"] == "Plastisol sas"
+
+
+def test_flujo_proveedor_del_xml_gana_sobre_el_asunto(escanear):
+    xml = xml_factura(numero="FE10647", proveedor="RELLENOS Y FIBRAS", total="820000.00")
+    asunto = "43048845;LUZ EDIT GIL DUQUE;FE10647;01;RELLENOS Y FIBRAS"
+    _, _, filas = escanear([correo(asunto, adjuntos=[("fv.xml", xml)])])
+    assert filas[0]["proveedor"] == "RELLENOS Y FIBRAS"
+
+
+# --------------------------------------------------------------- número de factura
+def test_attached_document_numero(bot):
+    assert bot.extract_invoice_number_from_xml_bytes(xml_attached(numero="FE94506")) == "FE 94506"
+
+
+def test_normaliza_numero_con_guion(bot):
+    assert bot._normalize_invoice_candidate("FE-94506") == "FE 94506"
+
+
+def test_estructura_con_asunto_partido(escanear):
+    """Asunto largo partido en dos líneas (\\r\\n): antes la factura quedaba N/A."""
+    partido = (b"900418527;IMPORTADORA DE INSUMOS EL MAYORISTA\r\n"
+               b" SAS;E4MD56131511;01;IMPORTADORA DE INSUMOS EL MAYORISTA SAS")
+    _, _, filas = escanear([correo("", "Adjunto documento. Total a pagar $ 340.000", asunto_crudo=partido)])
+    assert filas[0]["factura"] == "E4MD56131511"
+    assert filas[0]["proveedor"] == "IMPORTADORA DE INSUMOS EL MAYORISTA SAS"
+
+
+def test_estructura_falso_positivo(escanear):
+    insertadas, _, _ = escanear([correo("Pedido 1234567; Juan Perez; enviado", "Tu pedido llega mañana. Valor $50.000")])
+    assert insertadas == 0
+
+
+@pytest.mark.parametrize("asunto", [
+    "900123456;PROVEEDOR DEMO SAS;PENDIENTE;01",      # tercer campo sin dígitos
+    "900123456;PROVEEDOR DEMO SAS;FE100;urgente",     # cuarto campo no es un código
+])
+def test_estructura_exige_forma_de_factura(bot, asunto):
+    assert bot.extract_structured_email_invoice_and_supplier(asunto, "") == ("", "")
+
+
+def test_flujo_numero_del_asunto_gana_sobre_el_texto_del_pdf(bot, escanear, monkeypatch):
+    """Caso ANTIOQUEÑA DE MAQUINAS: el PDF daba FES 1067300 y el asunto dice FES106730."""
+    monkeypatch.setattr(bot, "extract_text_from_pdf_bytes",
+                        lambda _b: "FACTURA ELECTRÓNICA DE VENTA FES 1067300\nTOTAL A PAGAR 1.300.000")
+    asunto = "800025054;ANTIOQUEÑA DE MAQUINAS Y CIA S.A.S;FES106730;01;ANTIOQUENA DE MAQUINAS"
+    _, _, filas = escanear([correo(asunto, adjuntos=[("fv.pdf", b"%PDF-falso")])])
+    assert (filas[0]["factura"], filas[0]["valor"]) == ("FES 106730", 1300000)
+
+
+# ------------------------------------------------------------------------- valor
+def test_valor_del_xml_gana_sobre_el_cuerpo_del_correo(escanear):
+    xml = xml_factura(numero="FE10647", proveedor="RELLENOS Y FIBRAS", total="180000.00")
+    _, _, filas = escanear([correo("Factura FE10647", "Total a pagar $2.840 por flete.", [("fv.xml", xml)])])
+    assert filas[0]["valor"] == 180000
+
+
+PDF_EN_LINEAS = "SUBTOTAL\n229.800\nIVA\n43.662\nTotal líneas o ítems: 1\nTOTAL DE LA OPERACIÓN\n273.462\nNIT 900.123.456-7\n"
+
+
+def test_pdf_total_con_etiqueta_y_valor_en_lineas_distintas(bot):
+    assert bot.find_best_total_by_labels(PDF_EN_LINEAS)[0] == 273462
+
+
+def test_pdf_respaldo_no_toma_un_nit_como_valor(bot):
+    valores = bot.extract_invoice_values(PDF_EN_LINEAS)
+    assert max(v[0] for v in valores) == 273462
+
+
+def test_un_total_de_1_no_es_valor_de_factura(bot):
+    assert bot.find_best_total_by_labels("Total: 1") is None
+
+
+# ------------------------------------------------------------------ deduplicación
+def test_dos_facturas_sin_numero_con_el_mismo_valor(escanear):
+    a = correo("Invoice de agosto", "Total a pagar $ 50.000", remitente="Proveedor A <a@a.test>")
+    b = correo("Invoice de agosto", "Total a pagar $ 50.000", remitente="Proveedor B <b@b.test>")
+    insertadas, _, _ = escanear([a, b])
+    assert insertadas == 2
+
+
+# ----------------------------------------------------------------------- Análisis
+def _hoy_octubre(bot):
+    return bot.InvoiceRecord(
+        message_id="<hoy@correo.test>", invoice_number="PV 15701", email_date="Thu, 01 Oct 2026 16:18:11 +0000",
+        stored_date="2026-10-01", remitente_fijo="sebas duncan sas", remitente_real="Plastisol sas",
+        asunto="x", valor_entero=456000, moneda="COP", palabra_clave="factura", uid="1",
+    )
+
+
+def test_analisis_no_pierde_la_historia_de_hoja1(bot, sheets_falso):
+    """Análisis se arma desde hoja1: la base puede traer solo los registros de hoy."""
+    cfg, hoja1, analisis = sheets_falso
+    hoja1.filas = [
+        list(bot.SHEET_HEADERS),
+        ["RELLENOS Y FIBRAS", "Tue, 01 Sep 2026 19:48:02 +0000", "FE 10392", "d" * 32, "820000", "x", "factura"],
+    ]
+    bot.sync_to_google_sheets(cfg, [_hoy_octubre(bot)])
+    assert analisis.filas[0][:3] == ["Proveedor", "Sep 2026", "Oct 2026"]
+    por_proveedor = {f[0]: f[1:3] for f in analisis.filas[1:]}
+    assert por_proveedor["RELLENOS Y FIBRAS"] == [820000, 0]
+    assert por_proveedor["Plastisol sas"] == [0, 456000]
+    assert por_proveedor["TOTAL"] == [820000, 456000]
+
+
+def test_analisis_respeta_correcciones_hechas_a_mano(bot, sheets_falso):
+    """Valor en blanco (nota crédito anotada a mano) no suma; '1,230,000' se lee como número."""
+    cfg, hoja1, analisis = sheets_falso
+    hoja1.filas = [
+        list(bot.SHEET_HEADERS),
+        ["CAYLI TEXTILES SAS", "Mon, 28 Sep 2026 19:27:55 +0000", "NC 287", "e" * 32, "", "x", "factura", "NOTA CREDITO"],
+        ["CAYLI TEXTILES SAS", "Mon, 28 Sep 2026 18:47:12 +0000", "FEA 322", "f" * 32, "850000", "x", "factura"],
+        ["RELLENOS Y FIBRAS", "Tue, 29 Sep 2026 12:53:59 +0000", "FE 10647", "0" * 32, "1,230,000", "x", "factura"],
+    ]
+    bot.sync_to_google_sheets(cfg, [])
+    por_proveedor = {f[0]: f[1] for f in analisis.filas[1:]}
+    assert por_proveedor == {"CAYLI TEXTILES SAS": 850000, "RELLENOS Y FIBRAS": 1230000, "TOTAL": 2080000}
+
+
+@pytest.mark.parametrize("celda, esperado", [
+    ("820000", 820000), ("1,230,000", 1230000), ("273.462", 273462), ("$ 81.000", 81000),
+    ("100000.00", 100000), ("-850000", -850000), ("", None), ("Valor", None), (None, None),
+])
+def test_valor_de_celda_de_hoja1(bot, celda, esperado):
+    assert bot._sheet_value_to_int(celda) == esperado
+
+
+# ------------------------------------------------------------------ lectura IMAP
+def test_el_buzon_se_abre_en_solo_lectura(bot, monkeypatch):
+    """El bot no debe marcar como leídos los correos que revisa."""
+    from conftest import config_prueba
+    llamadas = {}
+
+    class ImapSimulado:
+        def __init__(self, host, port):
+            pass
+
+        def login(self, usuario, clave):
+            pass
+
+        def select(self, carpeta, readonly=False):
+            llamadas["readonly"] = readonly
+
+    monkeypatch.setattr(bot.imaplib, "IMAP4_SSL", ImapSimulado)
+    bot.connect_imap(config_prueba())
+    assert llamadas["readonly"] is True
+
+
+# ------------------------------------------------- corrida por rango (reconstrucción)
+def test_corrida_por_rango_deja_hoja1_de_la_mas_reciente_a_la_mas_antigua(corrida_diaria):
+    """Reconstruir la hoja con --start-date/--end-date: 30 facturas, lotes de 25, orden final correcto."""
+    correr, hoja1 = corrida_diaria
+    hoja1.filas = []
+    crudos = [
+        correo(f"900123456;PROVEEDOR DEMO SAS;FE{1000 + dia};01;PROVEEDOR DEMO SAS", "Total a pagar $ 100.000",
+               fecha=f"{dia:02d} Sep 2026 12:00:00 +0000")
+        for dia in range(1, 31)
+    ]
+    resultado = correr(crudos, datetime(2026, 10, 2, 1, 0, tzinfo=timezone.utc),
+                       start_date="2026-09-01", end_date="2026-09-30")
+    assert resultado["inserted_first_pass"] == 30
+    assert hoja1.filas[0][0] == "Proveedor"
+    assert [f[2] for f in hoja1.filas[1:]] == [f"FE {1000 + dia}" for dia in range(30, 0, -1)]

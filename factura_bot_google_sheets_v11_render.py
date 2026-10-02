@@ -250,8 +250,14 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 ON facturas (stored_date, message_id, valor_entero)
             """)
             cur.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_facturas_invoice
+                DROP INDEX IF EXISTS idx_facturas_invoice
+            """)
+            # Solo aplica a facturas con numero: dos facturas distintas sin
+            # numero y con el mismo valor no deben bloquearse entre si.
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_facturas_invoice_num
                 ON facturas (stored_date, invoice_number, valor_entero)
+                WHERE invoice_number IS NOT NULL AND invoice_number <> ''
             """)
             # Cloud deduplication: invoice number + value should not be inserted
             # again merely because a previous historical import used another stored_date.
@@ -291,6 +297,7 @@ def init_db(db_path: Path = DB_PATH) -> None:
         cols = {row[1] for row in cur.fetchall()}
         if "invoice_number" not in cols:
             cur.execute("ALTER TABLE facturas ADD COLUMN invoice_number TEXT")
+        cur.execute("DROP INDEX IF EXISTS idx_facturas_invoice")
         cur.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_facturas_msg_valor
@@ -299,8 +306,9 @@ def init_db(db_path: Path = DB_PATH) -> None:
         )
         cur.execute(
             """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_facturas_invoice
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_facturas_invoice_num
             ON facturas (stored_date, invoice_number, valor_entero)
+            WHERE invoice_number IS NOT NULL AND invoice_number <> ''
             """
         )
         conn.commit()
@@ -465,6 +473,11 @@ def _compile_money_matches(text: str) -> List[Tuple[int, int, str]]:
     raw_matches: List[Tuple[int, int, str]] = []
     for pattern in patterns:
         for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            # Un NIT escrito con puntos (900.123.456-7) no es un valor.
+            before = text[max(0, match.start() - 12):match.start()].lower()
+            after = text[match.end():match.end() + 2]
+            if re.match(r"-\d", after) or re.search(r"\bnit\b[\s.:#-]*$", before):
+                continue
             raw_matches.append((match.start(), match.end(), match.group(0).strip()))
 
     raw_matches.sort(key=lambda item: (item[0], -(item[1] - item[0])))
@@ -505,6 +518,15 @@ def parse_value_from_text(raw: str) -> Optional[int]:
         return None
 
 
+def _looks_like_money(raw: str, value: int) -> bool:
+    """Descarta conteos como 'Total: 1'.
+
+    Un total real trae simbolo de moneda, separador de miles o decimales, o
+    al menos cuatro digitos.
+    """
+    return value >= 1000 or bool(re.search(r"[$€]|COP|USD|EUR|[.,]\d", raw or "", flags=re.I))
+
+
 def find_best_total_by_labels(text: str) -> Optional[Tuple[int, str, str]]:
     if not text:
         return None
@@ -518,6 +540,7 @@ def find_best_total_by_labels(text: str) -> Optional[Tuple[int, str, str]]:
         r"(monto\s*total)[^\d$€]{0,30}([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
         r"(importe\s*total)[^\d$€]{0,30}([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
         r"(^|\n)\s*(total)\s*[:\-]?\s*([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
+        r"(total\s*de\s*la\s*operaci[oó]n)[^\d$€]{0,30}([$€]?\s*(?:COP|USD|EUR|US\$)?\s*\d[\d\.,]*)",
     ]
 
     for pattern in candidate_patterns:
@@ -530,7 +553,7 @@ def find_best_total_by_labels(text: str) -> Optional[Tuple[int, str, str]]:
                 # allow if label is the exact priority one; ignore surrounding "subtotal"/"iva"
                 pass
             value_int = parse_value_from_text(raw_value)
-            if value_int is not None and value_int > 0:
+            if value_int is not None and value_int > 0 and _looks_like_money(raw_value, value_int):
                 return value_int, detect_currency(raw_value), raw_value.strip()
 
     # Fallback line-by-line: choose a line with total-like label and not ignored label.
@@ -550,7 +573,7 @@ def _normalize_invoice_candidate(raw: str) -> str:
     value = normalize_spaces(raw or "").strip(" :#.-")
     value = re.sub(r"\s*[-/]\s*", "-", value)
     # Common layout: FEPI 40716 -> FEPI 40716.
-    m = re.fullmatch(r"([A-Z]{2,12})\s*(\d{1,20})", value, flags=re.IGNORECASE)
+    m = re.fullmatch(r"([A-Z]{2,12})[\s-]*(\d{1,20})", value, flags=re.IGNORECASE)
     if m:
         return f"{m.group(1).upper()} {m.group(2)}"
     return value.upper().replace(" ", "")
@@ -755,6 +778,21 @@ def get_attachments(msg: email.message.Message) -> List[Tuple[str, bytes]]:
     return attachments
 
 
+def _embedded_invoice_roots(root: ET.Element) -> List[ET.Element]:
+    """Facturas embebidas como texto (CDATA) dentro de un AttachedDocument DIAN."""
+    roots: List[ET.Element] = []
+    for elem in root.iter():
+        text = elem.text or ""
+        if "<Invoice" not in text and "<CreditNote" not in text and "<DebitNote" not in text:
+            continue
+        for match in re.finditer(r"<(Invoice|CreditNote|DebitNote)\b[\s\S]*?</\1>", text):
+            try:
+                roots.append(ET.fromstring(match.group(0)))
+            except Exception:
+                continue
+    return roots
+
+
 def extract_invoice_number_from_xml_bytes(xml_bytes: bytes) -> str:
     """Extract the DIAN invoice ID from XML before falling back to PDF text."""
     try:
@@ -764,9 +802,11 @@ def extract_invoice_number_from_xml_bytes(xml_bytes: bytes) -> str:
 
     # In UBL/DIAN XML the document identifier is normally cbc:ID directly
     # under Invoice. Avoid UUID/CUFE and other IDs nested in other structures.
-    root_tag = root.tag.split("}")[-1].lower()
-    if root_tag in ("invoice", "creditnote", "debitnote"):
-        for child in list(root):
+    for doc_root in [root] + _embedded_invoice_roots(root):
+        root_tag = doc_root.tag.split("}")[-1].lower()
+        if root_tag not in ("invoice", "creditnote", "debitnote"):
+            continue
+        for child in list(doc_root):
             if child.tag.split("}")[-1].lower() == "id":
                 value = (child.text or "").strip()
                 if value:
@@ -1010,9 +1050,16 @@ def _looks_like_technical_provider(name: str) -> bool:
     technical = (
         "ateb", "cofidi", "siesa", "world office", "worldoffice",
         "siigo", "facturatech", "the factory hka", "hka", "edigital",
-        "proveedor tecnologico", "proveedor tecnológico", "software"
+        "proveedor tecnologico", "proveedor tecnológico", "software",
+        "sistemas de informacion empresarial", "sistemas de información empresarial",
     )
     return any(x in low for x in technical)
+
+
+def _is_own_company(name: str) -> bool:
+    """True si el nombre es el del comprador (Sebas Duncan SAS), que nunca es el proveedor."""
+    low = re.sub(r"[^a-z0-9]+", " ", normalize_spaces(name).lower())
+    return "sebas duncan" in low
 
 
 def extract_supplier_name_from_xml_bytes(xml_bytes: bytes) -> str:
@@ -1020,19 +1067,20 @@ def extract_supplier_name_from_xml_bytes(xml_bytes: bytes) -> str:
         root = ET.fromstring(xml_bytes)
     except Exception:
         return ""
-    for supplier in root.iter():
-        if supplier.tag.split("}")[-1].lower() != "accountingsupplierparty":
-            continue
-        candidates = []
-        for elem in supplier.iter():
-            tag = elem.tag.split("}")[-1].lower()
-            if tag in ("registrationname", "name"):
-                value = _clean_supplier_name(elem.text or "")
-                if value and not _looks_like_technical_provider(value):
-                    candidates.append((0 if tag == "registrationname" else 1, value))
-        if candidates:
-            candidates.sort(key=lambda x: x[0])
-            return candidates[0][1]
+    for doc_root in [root] + _embedded_invoice_roots(root):
+        for supplier in doc_root.iter():
+            if supplier.tag.split("}")[-1].lower() != "accountingsupplierparty":
+                continue
+            candidates = []
+            for elem in supplier.iter():
+                tag = elem.tag.split("}")[-1].lower()
+                if tag in ("registrationname", "name"):
+                    value = _clean_supplier_name(elem.text or "")
+                    if value and not _looks_like_technical_provider(value) and not _is_own_company(value):
+                        candidates.append((0 if tag == "registrationname" else 1, value))
+            if candidates:
+                candidates.sort(key=lambda x: x[0])
+                return candidates[0][1]
     return ""
 
 
@@ -1077,18 +1125,24 @@ def extract_supplier_name_from_text(text: str) -> str:
                 and not re.search(r"\d{6,}", val)):
             candidates.append((12, val))
 
+    # El comprador aparece en toda factura y suele traer "SAS": nunca es el proveedor.
+    candidates = [c for c in candidates if not _is_own_company(c[1])]
     if candidates:
         candidates.sort(key=lambda x: (-x[0], x[1]))
         return candidates[0][1]
     return ""
 
 
-def extract_supplier_name_from_attachments(msg: email.message.Message) -> str:
+def extract_supplier_name_from_xml_attachments(msg: email.message.Message) -> str:
     for filename, payload in iter_supported_attachment_files(msg):
         if filename.lower().endswith(".xml"):
             name = extract_supplier_name_from_xml_bytes(payload)
             if name:
                 return name
+    return ""
+
+
+def extract_supplier_name_from_pdf_attachments(msg: email.message.Message) -> str:
     for filename, payload in iter_supported_attachment_files(msg):
         if filename.lower().endswith(".pdf"):
             name = extract_supplier_name_from_text(extract_text_from_pdf_bytes(payload))
@@ -1096,20 +1150,41 @@ def extract_supplier_name_from_attachments(msg: email.message.Message) -> str:
                 return name
     return ""
 
-def extract_invoice_number_from_attachments(msg: email.message.Message) -> str:
+
+def extract_supplier_name_from_attachments(msg: email.message.Message) -> str:
+    return extract_supplier_name_from_xml_attachments(msg) or extract_supplier_name_from_pdf_attachments(msg)
+
+def extract_invoice_number_from_xml_attachments(msg: email.message.Message) -> str:
     # XML has priority because it contains the structured DIAN document ID.
     for filename, payload in iter_supported_attachment_files(msg):
         if filename.lower().endswith(".xml"):
             number = extract_invoice_number_from_xml_bytes(payload)
             if number:
                 return number
+    return ""
 
-    # Then use the PDF's visible invoice context.
+
+def extract_invoice_number_from_attachment_texts(msg: email.message.Message) -> str:
+    # The PDF's visible invoice context (heuristico, menos confiable).
     for _name, text in extract_attachment_texts(msg):
         number = extract_invoice_number(text)
         if number:
             return number
     return ""
+
+
+def extract_invoice_number_from_attachments(msg: email.message.Message) -> str:
+    return extract_invoice_number_from_xml_attachments(msg) or extract_invoice_number_from_attachment_texts(msg)
+
+
+def extract_xml_value_from_attachments(msg: email.message.Message) -> Optional[Tuple[int, str, str]]:
+    """Total legal del XML (LegalMonetaryTotal), que es la fuente de verdad del valor."""
+    for filename, payload in iter_supported_attachment_files(msg):
+        if filename.lower().endswith(".xml"):
+            vals = extract_values_from_xml_bytes(payload)
+            if vals:
+                return max(vals, key=lambda x: x[0])
+    return None
 
 
 def extract_best_value_from_attachments(msg: email.message.Message) -> Optional[Tuple[int, str, str]]:
@@ -1158,7 +1233,8 @@ def connect_imap(cfg: Config):
     else:
         client = imaplib.IMAP4(cfg.imap_host, cfg.imap_port)
     client.login(cfg.email_address, cfg.email_password)
-    client.select(cfg.inbox_folder)
+    # Solo lectura: el bot no debe marcar los correos como leidos.
+    client.select(cfg.inbox_folder, readonly=True)
     return client
 
 
@@ -1515,6 +1591,12 @@ def extract_structured_email_invoice_and_supplier(subject: str, body_text: str) 
                 continue
             if not re.fullmatch(r"[A-Z0-9][A-Z0-9 ._-]{1,30}", candidate, flags=re.I):
                 continue
+            # Un numero de factura siempre trae digitos, y el cuarto campo
+            # (tipo de documento DIAN: 01, 91...) es un codigo numerico.
+            if not re.search(r"\d", candidate):
+                continue
+            if len(parts) >= 4 and parts[3] and not re.fullmatch(r"\d{1,3}", parts[3]):
+                continue
             invoice = _normalize_invoice_candidate(candidate)
             if not invoice or len(invoice.replace(" ", "")) > 30:
                 continue
@@ -1543,7 +1625,8 @@ def _scan_and_store(
             if not (start_dt <= msg_date <= end_dt):
                 continue
 
-            subject = decode_mime_header(msg.get("Subject", ""))
+            # Los asuntos largos llegan partidos en varias lineas (\r\n + espacio).
+            subject = normalize_spaces(decode_mime_header(msg.get("Subject", "")))
             from_real = decode_mime_header(msg.get("From", ""))
             message_id = msg.get("Message-ID", "").strip() or f"NO_MESSAGE_ID_{uid}"
             body_text = get_message_text(msg)
@@ -1594,17 +1677,30 @@ def _scan_and_store(
 
             # The invoice document is the source of truth. Prefer XML/PDF
             # over the email subject/body because email templates vary by sender.
-            invoice_number = extract_invoice_number_from_attachments(msg)
+            # Prioridad: XML > asunto estructurado > texto de adjuntos > texto del correo.
+            invoice_number = extract_invoice_number_from_xml_attachments(msg)
             if not invoice_number:
-                invoice_number = structured_invoice or extract_invoice_number(haystack)
+                invoice_number = structured_invoice
+            if not invoice_number:
+                invoice_number = extract_invoice_number_from_attachment_texts(msg)
+            if not invoice_number:
+                invoice_number = extract_invoice_number(haystack)
 
             # El proveedor se intenta obtener del documento, no del software remitente.
-            supplier_name = extract_supplier_name_from_attachments(msg)
+            # Prioridad: XML > asunto estructurado > texto del PDF > remitente.
+            supplier_name = extract_supplier_name_from_xml_attachments(msg)
             if not supplier_name:
-                supplier_name = structured_supplier or _supplier_name(from_real)
+                supplier_name = structured_supplier
+            if not supplier_name:
+                supplier_name = extract_supplier_name_from_pdf_attachments(msg)
+            if not supplier_name:
+                supplier_name = _supplier_name(from_real)
 
             # Prioridad: valor etiquetado en texto -> adjunto -> fallback números
-            best_value = find_best_total_by_labels(haystack)
+            # El total legal del XML manda sobre cualquier "total" del correo.
+            best_value = extract_xml_value_from_attachments(msg)
+            if best_value is None:
+                best_value = find_best_total_by_labels(haystack)
             if best_value is None:
                 best_value = extract_best_value_from_attachments(msg)
 
@@ -1819,6 +1915,50 @@ def _month_key_from_email_date(email_date: str, stored_date: str) -> str:
     return ""
 
 
+def _sheet_value_to_int(raw) -> Optional[int]:
+    """Convierte el valor de una celda de hoja1 ('820000', '1,230,000', '') en entero."""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    negative = text.startswith("-") or (text.startswith("(") and text.endswith(")"))
+    text = re.sub(r"[.,]\d{1,2}$", "", text)
+    digits = re.sub(r"\D", "", text)
+    if not digits:
+        return None
+    return -int(digits) if negative else int(digits)
+
+
+def _analysis_records_from_sheet(values: List[List[str]]) -> List[InvoiceRecord]:
+    """Arma los registros del analisis a partir de las filas de hoja1.
+
+    hoja1 es el historial completo y trae las correcciones hechas a mano
+    (por ejemplo, el valor en blanco de una nota credito). Las filas sin
+    proveedor o sin valor numerico, como el encabezado, se omiten.
+    """
+    records: List[InvoiceRecord] = []
+    for row in values:
+        if len(row) < 5:
+            continue
+        provider = str(row[0]).strip()
+        value = _sheet_value_to_int(row[4])
+        if not provider or value is None:
+            continue
+        records.append(InvoiceRecord(
+            message_id=str(row[3]).strip(),
+            invoice_number=str(row[2]).strip(),
+            email_date=str(row[1]).strip(),
+            stored_date="",
+            remitente_fijo=FIXED_SENDER_NAME,
+            remitente_real=provider,
+            asunto=str(row[5]).strip() if len(row) > 5 else "",
+            valor_entero=value,
+            moneda="",
+            palabra_clave=str(row[6]).strip() if len(row) > 6 else "",
+            uid="",
+        ))
+    return records
+
+
 def _analysis_data(records: List[InvoiceRecord]) -> Tuple[List[str], List[List[object]]]:
     """Build the provider/month matrix used by the original 'Análisis' sheet."""
     totals: Dict[str, Dict[str, int]] = {}
@@ -1908,8 +2048,11 @@ def sync_to_google_sheets(cfg: Config, records: List[InvoiceRecord]) -> dict:
         rows_to_append.sort(key=lambda row: _email_date_sort_key(row[1]), reverse=True)
         _insert_rows_at(facturas_ws, rows_to_append, 2)
 
-    # Rebuild analysis from SQLite so it always represents the complete history.
-    headers, analysis_rows = _analysis_data(records)
+    # El analisis se arma desde hoja1, que es el historial completo. La base de
+    # datos puede tener solo los registros de esta corrida (en Render se pierde
+    # entre corridas), y con ella el analisis quedaba incompleto.
+    sheet_records = _analysis_records_from_sheet(facturas_ws.get_all_values())
+    headers, analysis_rows = _analysis_data(sheet_records)
     analysis_ws.clear()
     all_rows = [headers] + analysis_rows
     analysis_ws.update(range_name="A1", values=all_rows, value_input_option="USER_ENTERED")
