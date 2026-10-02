@@ -807,3 +807,133 @@ def test_consulta_de_trm(bot, monkeypatch):
     respuestas[:] = [[{"valor": "4.12"}]]
     monkeypatch.setattr(bot, "_TRM_CACHE", {})
     assert bot.get_trm_for_date(dia) is None                   # valor absurdo: no se usa
+
+
+# ------------------------------------------------------------- notas crédito (tipo 91)
+def xml_nota_credito(numero, proveedor, total, embebida=False):
+    """Nota crédito UBL: la misma forma de una factura, con raíz CreditNote."""
+    base = xml_attached(numero, proveedor, total) if embebida else xml_factura(numero, proveedor, total)
+    return base.replace(b"Invoice", b"CreditNote")
+
+
+def test_nota_credito_resta_y_usa_su_propio_numero(escanear):
+    asunto = "901859681;CAYLI TEXTILES SAS;NC287;91;CAYLI TEXTILES SAS"
+    xml = xml_nota_credito("NC287", "CAYLI TEXTILES SAS", "850000.00")
+    _, _, filas = escanear([correo(asunto, adjuntos=[("nc.xml", xml)])])
+    assert (filas[0]["factura"], filas[0]["proveedor"], filas[0]["valor"], filas[0]["keyword"]) == (
+        "NC 287", "CAYLI TEXTILES SAS", -850000, "nota credito")
+
+
+def test_nota_credito_en_attached_document_con_numero_corto(escanear):
+    """Caso EFFISYSTEMS: nota 2666; antes quedaba con el número de la factura corregida y valor 1."""
+    asunto = "901173460;EFFISYSTEMS S.A.S.;2666;91;EFFISYSTEMS S.A.S.;"
+    xml = xml_nota_credito("2666", "EFFISYSTEMS S.A.S.", "100000.00", embebida=True)
+    _, _, filas = escanear([correo(asunto, adjuntos=[("ad.xml", xml)])])
+    assert (filas[0]["factura"], filas[0]["valor"]) == ("2666", -100000)
+
+
+def test_nota_credito_reconocida_solo_por_el_xml(escanear):
+    xml = xml_nota_credito("NC288", "CAYLI TEXTILES SAS", "120000.00")
+    _, _, filas = escanear([correo("Documento electrónico", "Adjuntamos su factura.", [("nc.xml", xml)])])
+    assert (filas[0]["factura"], filas[0]["valor"], filas[0]["keyword"]) == ("NC 288", -120000, "nota credito")
+
+
+def test_nota_credito_sin_xml_usa_el_valor_del_correo(escanear):
+    asunto = "901859681;CAYLI TEXTILES SAS;NC290;91;CAYLI TEXTILES SAS"
+    _, _, filas = escanear([correo(asunto, "Total a pagar $ 50.000")])
+    assert (filas[0]["factura"], filas[0]["valor"]) == ("NC 290", -50000)
+
+
+def test_factura_normal_tipo_01_sigue_positiva(escanear):
+    xml = xml_factura(numero="FE10647", proveedor="RELLENOS Y FIBRAS", total="1230000.00")
+    _, _, filas = escanear([correo(RELLENOS, adjuntos=[("fv.xml", xml)])])
+    assert filas[0]["valor"] == 1230000 and filas[0]["keyword"] == "factura"
+
+
+def test_nota_credito_queda_anotada_y_resta_en_analisis(bot, sheets_falso):
+    cfg, hoja1, analisis = sheets_falso
+    factura = _registro(bot, message_id="<f@x>", factura="FEA 322", valor=850000, proveedor="CAYLI TEXTILES SAS",
+                        fecha="Mon, 28 Sep 2026 18:47:12 +0000")
+    nota = _registro(bot, message_id="<n@x>", factura="NC 287", valor=-850000, proveedor="CAYLI TEXTILES SAS",
+                     fecha="Mon, 28 Sep 2026 19:27:55 +0000")
+    bot.sync_to_google_sheets(cfg, [factura, nota])
+    fila_nota = next(f for f in hoja1.filas if f[2] == "NC 287")
+    assert fila_nota[4] == -850000 and fila_nota[7] == "NOTA CREDITO"
+    por_proveedor = {f[0]: f[1] for f in analisis.filas[1:]}
+    assert por_proveedor["CAYLI TEXTILES SAS"] == 0
+
+
+# ------------------------------------------------- exclusión por "DIAN" y estructura
+def test_estructura_valida_entra_aunque_el_correo_mencione_dian(escanear):
+    xml = xml_factura(numero="FE10647", proveedor="RELLENOS Y FIBRAS", total="1230000.00")
+    insertadas, excluidas, filas = escanear([correo(RELLENOS, "Documento validado por la DIAN.", [("fv.xml", xml)])])
+    assert (insertadas, excluidas) == (1, 0)
+    assert filas[0]["factura"] == "FE 10647"
+
+
+def test_correo_sin_estructura_que_menciona_dian_sigue_excluido(escanear):
+    insertadas, excluidas, _ = escanear([correo("Factura: notificación DIAN", "Total a pagar $ 10.000")])
+    assert (insertadas, excluidas) == (0, 1)
+
+
+# ------------------------------------------------ la misma factura en dos correos
+ASUNTO_10148 = "43048845;LUZ EDIT GIL DUQUE;FE10148;01;RELLENOS Y FIBRAS"
+
+
+def _dos_correos_fe10148():
+    con_xml = correo(ASUNTO_10148, adjuntos=[("fv.xml", xml_factura("FE10148", "LUZ EDIT GIL DUQUE", "802773.00"))])
+    sin_xml = correo(ASUNTO_10148, "Total a pagar $ 820.000")
+    return con_xml, sin_xml
+
+
+@pytest.mark.parametrize("orden", ["xml_primero", "xml_despues"])
+def test_factura_repetida_en_dos_correos_queda_una_con_el_valor_del_xml(escanear, orden):
+    """Caso FE 10148: estaba dos veces en hoja1, con 820.000 y con 802.773."""
+    con_xml, sin_xml = _dos_correos_fe10148()
+    crudos = [con_xml, sin_xml] if orden == "xml_primero" else [sin_xml, con_xml]
+    insertadas, _, filas = escanear(crudos)
+    assert insertadas == 1
+    assert [(f["factura"], f["valor"]) for f in filas] == [("FE 10148", 802773)]
+
+
+def test_factura_repetida_con_nombres_distintos_se_reconoce_por_el_nit(escanear):
+    """El XML trae la razón social y el asunto el nombre de la persona: es la misma factura."""
+    con_xml = correo(ASUNTO_10148, adjuntos=[("fv.xml", xml_factura("FE10148", "RELLENOS Y FIBRAS", "802773.00"))])
+    sin_xml = correo(ASUNTO_10148, "Total a pagar $ 820.000")
+    _, _, filas = escanear([sin_xml, con_xml])
+    assert [(f["proveedor"], f["valor"]) for f in filas] == [("RELLENOS Y FIBRAS", 802773)]
+
+
+def test_factura_repetida_sin_xml_conserva_la_primera(escanear):
+    a = correo(ASUNTO_10148, "Total a pagar $ 820.000")
+    b = correo(ASUNTO_10148, "Total a pagar $ 802.773")
+    _, _, filas = escanear([a, b])
+    assert [f["valor"] for f in filas] == [820000]
+
+
+def test_mismo_numero_de_otro_proveedor_no_es_repetida(escanear):
+    a = correo("900111222;PROVEEDOR UNO SAS;FE100;01;PROVEEDOR UNO SAS", "Total a pagar $ 100.000")
+    b = correo("900333444;PROVEEDOR DOS SAS;FE100;01;PROVEEDOR DOS SAS", "Total a pagar $ 250.000")
+    insertadas, _, _ = escanear([a, b])
+    assert insertadas == 2
+
+
+def test_hoja1_no_repite_una_factura_que_llega_en_otro_correo(bot, sheets_falso):
+    """Entre corridas distintas: la fila que ya está se conserva y la nueva no entra."""
+    cfg, hoja1, _ = sheets_falso
+    bot.sync_to_google_sheets(cfg, [_registro(bot, message_id="<1@x>", factura="FE 10148", valor=820000)])
+    mismo_proveedor = _registro(bot, message_id="<2@x>", factura="FE 10148", valor=802773)
+    otro_nombre_mismo_valor = _registro(bot, message_id="<3@x>", factura="FE 10148", valor=820000,
+                                        proveedor="LUZ EDIT GIL DUQUE")
+    resultado = bot.sync_to_google_sheets(cfg, [mismo_proveedor, otro_nombre_mismo_valor])
+    assert resultado["inserted"] == 0
+    assert [f[2] for f in hoja1.filas[1:]] == ["FE 10148"]
+
+
+def test_hoja1_acepta_el_mismo_numero_de_otro_proveedor(bot, sheets_falso):
+    cfg, hoja1, _ = sheets_falso
+    bot.sync_to_google_sheets(cfg, [_registro(bot, message_id="<1@x>", factura="FE 100", valor=100000,
+                                              proveedor="PROVEEDOR UNO SAS")])
+    resultado = bot.sync_to_google_sheets(cfg, [_registro(bot, message_id="<2@x>", factura="FE 100", valor=250000,
+                                                          proveedor="PROVEEDOR DOS SAS")])
+    assert resultado["inserted"] == 1
