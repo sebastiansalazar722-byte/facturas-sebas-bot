@@ -393,6 +393,18 @@ def build_day_range_local(target_date: datetime) -> Tuple[datetime, datetime]:
     return start, end
 
 
+def build_daily_scan_range_local(now: datetime) -> Tuple[datetime, datetime]:
+    """Ventana de la corrida diaria: desde ayer 00:00 hasta hoy 23:59.
+
+    Render corre en UTC a la 01:00, 13:00 y 19:00. Revisando solo "hoy", los
+    correos que llegan entre las 19:00 y las 23:59 UTC (2 pm a 7 pm en
+    Colombia) no entraban en ninguna corrida. Incluir el dia anterior cierra
+    ese hueco; la deduplicacion evita que se repitan facturas.
+    """
+    start, end = build_day_range_local(now)
+    return start - timedelta(days=1), end
+
+
 def build_custom_range_local(start_date_str: str, end_date_str: str) -> Tuple[datetime, datetime, str]:
     start = datetime.strptime(start_date_str, "%Y-%m-%d").astimezone()
     end = datetime.strptime(end_date_str, "%Y-%m-%d").astimezone()
@@ -1378,7 +1390,7 @@ def process_mail_once(
     else:
         now = datetime.now().astimezone()
         stored_date = now.strftime("%Y-%m-%d")
-        start_dt, end_dt = build_day_range_local(now)
+        start_dt, end_dt = build_daily_scan_range_local(now)
         logging.info("Iniciando proceso para el día %s", stored_date)
 
     inserted_first_pass = 0
