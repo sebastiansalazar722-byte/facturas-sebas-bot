@@ -937,3 +937,35 @@ def test_hoja1_acepta_el_mismo_numero_de_otro_proveedor(bot, sheets_falso):
     resultado = bot.sync_to_google_sheets(cfg, [_registro(bot, message_id="<2@x>", factura="FE 100", valor=250000,
                                                           proveedor="PROVEEDOR DOS SAS")])
     assert resultado["inserted"] == 1
+
+
+# ------------------------------ hallazgos de la primera corrida real (agosto 2026)
+def test_hoja_recien_creada_recibe_los_titulos(bot, sheets_falso):
+    """En la corrida real la fila 1 quedó en blanco: gspread devuelve [[]] en una hoja vacía."""
+    cfg, hoja1, _ = sheets_falso
+    assert hoja1.get_all_values() == [[]]
+    bot.sync_to_google_sheets(cfg, [_registro(bot)])
+    assert hoja1.filas[0] == bot.SHEET_HEADERS
+    assert hoja1.filas[1][2] == "FE 10647"
+
+
+def test_fila_1_en_blanco_con_datos_debajo_recibe_los_titulos_sin_mover_nada(bot, sheets_falso):
+    """El estado en que quedó hoja1 tras esa corrida: se arregla sola en la siguiente."""
+    cfg, hoja1, _ = sheets_falso
+    dato = ["TEXTIFILH SAS", "Mon, 31 Aug 2026 16:12:13 +0000", "FE 622606", "b" * 32, "2200000", "x", "factura"]
+    hoja1.filas = [["", "", "", "", "", "", "", ""], list(dato)]
+    bot.sync_to_google_sheets(cfg, [])
+    assert hoja1.filas == [bot.SHEET_HEADERS, dato]
+
+
+def test_proveedor_con_nombre_comercial_configurado(escanear):
+    """El XML trae la persona (LUZ EDIT GIL DUQUE); debe aparecer como RELLENOS Y FIBRAS."""
+    xml = xml_factura(numero="FE10382", proveedor="LUZ EDIT GIL DUQUE", total="820000.00")
+    _, _, filas = escanear([correo("43048845;RELLENOS Y FIBRAS;FE10382;01;LUZ EDIT GIL DUQUE", adjuntos=[("fv.xml", xml)])])
+    assert filas[0]["proveedor"] == "RELLENOS Y FIBRAS"
+
+
+def test_proveedor_sin_nombre_comercial_configurado_no_cambia(escanear):
+    asunto = "15371295;YONIEL LEONARDO RAMIREZ GARCIA;YA551;01;YONIEL LEONARDO RAMIREZ GARCIA"
+    _, _, filas = escanear([correo(asunto, "Total a pagar $ 214.200")])
+    assert filas[0]["proveedor"] == "YONIEL LEONARDO RAMIREZ GARCIA"

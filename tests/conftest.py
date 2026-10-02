@@ -201,7 +201,8 @@ class HojaFalsa:
         self.spreadsheet = self
 
     def get_all_values(self):
-        return [list(f) for f in self.filas]
+        # Igual que gspread: una hoja vacía devuelve [[]], no una lista vacía.
+        return [list(f) for f in self.filas] or [[]]
 
     def append_row(self, fila, value_input_option=None):
         self.filas.append(list(fila))
