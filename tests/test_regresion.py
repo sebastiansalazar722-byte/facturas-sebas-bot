@@ -680,3 +680,130 @@ def test_corrida_por_rango_deja_hoja1_de_la_mas_reciente_a_la_mas_antigua(corrid
     assert resultado["inserted_first_pass"] == 30
     assert hoja1.filas[0][0] == "Proveedor"
     assert [f[2] for f in hoja1.filas[1:]] == [f"FE {1000 + dia}" for dia in range(30, 0, -1)]
+
+
+# ------------------------------------------- facturas en dólares (USD → COP con TRM)
+from decimal import Decimal
+
+
+@pytest.fixture
+def trm_fija(bot, monkeypatch):
+    """Fija la TRM y la fecha de Colombia para no depender de internet. Devuelve un dict editable."""
+    estado = {"trm": Decimal("4000.00"), "dia": datetime(2026, 9, 29).date()}
+    monkeypatch.setattr(bot, "get_trm_for_date", lambda _dia: estado["trm"])
+    monkeypatch.setattr(bot, "colombia_today", lambda: estado["dia"])
+    return estado
+
+
+XAI = dict(asunto="xAI API Invoice for 09/2026", cuerpo="Thanks for your business. Amount due $101.37 USD",
+           remitente="xAI <billing@x.test>")
+
+
+def test_usd_se_convierte_a_pesos_con_la_trm(escanear, trm_fija):
+    _, _, filas = escanear([correo(XAI["asunto"], XAI["cuerpo"], remitente=XAI["remitente"])])
+    assert filas[0]["valor"] == 405480          # 101.37 x 4000
+
+
+def test_usd_deja_nota_en_la_columna_h(bot, sheets_falso):
+    cfg, hoja1, _ = sheets_falso
+    rec = _registro(bot, message_id="<xai@x>", factura="", valor=405480, proveedor="xAI")
+    rec.moneda = "USD 101.37 x TRM 4000.00 (2026-09-29)"
+    bot.sync_to_google_sheets(cfg, [rec])
+    assert hoja1.filas[1][4] == 405480
+    assert hoja1.filas[1][7] == "USD 101.37 x TRM 4000.00 (2026-09-29)"
+
+
+def test_factura_en_pesos_no_lleva_nota(bot, sheets_falso):
+    cfg, hoja1, _ = sheets_falso
+    bot.sync_to_google_sheets(cfg, [_registro(bot)])
+    assert len(hoja1.filas[1]) == 7
+
+
+def test_usd_no_se_duplica_cuando_cambia_la_trm(corrida_diaria, trm_fija):
+    """La corrida del día siguiente ve el mismo correo con otra TRM: sigue siendo una sola fila."""
+    correr, hoja1 = corrida_diaria
+    crudo = correo(XAI["asunto"], XAI["cuerpo"], remitente=XAI["remitente"], fecha="Wed, 09 Sep 2026 21:30:00 +0000")
+    trm_fija.update(trm=Decimal("4000.00"), dia=datetime(2026, 9, 9).date())
+    correr([crudo], datetime(2026, 9, 10, 1, 0, tzinfo=timezone.utc))
+    trm_fija.update(trm=Decimal("4100.00"), dia=datetime(2026, 9, 10).date())
+    correr([crudo], datetime(2026, 9, 10, 13, 0, tzinfo=timezone.utc))
+    filas_usd = [f for f in hoja1.filas if len(f) > 7 and str(f[7]).startswith("USD")]
+    assert len(filas_usd) == 1
+    assert filas_usd[0][4] == 405480            # queda la TRM del día en que se registró
+
+
+def test_usd_en_xml_usa_la_moneda_del_xml(escanear, trm_fija):
+    xml = xml_factura(numero="INV100", proveedor="PROVEEDOR EXTERIOR LLC", total="250.50").replace(
+        b'currencyID="COP"', b'currencyID="USD"')
+    _, _, filas = escanear([correo("Invoice INV100", "Adjunto.", [("inv.xml", xml)])])
+    assert filas[0]["valor"] == 1002000         # 250.50 x 4000
+
+
+def test_xml_en_pesos_no_se_convierte_aunque_el_correo_diga_usd(escanear, trm_fija):
+    xml = xml_factura(numero="FE10647", proveedor="RELLENOS Y FIBRAS", total="820000.00")
+    _, _, filas = escanear([correo(RELLENOS, "Precio de referencia en USD 200.", [("fv.xml", xml)])])
+    assert filas[0]["valor"] == 820000
+
+
+def test_si_el_documento_dice_cop_no_se_convierte(escanear, trm_fija):
+    _, _, filas = escanear([correo("Factura de servicios", "Total a pagar COP 500.000. Equivalente USD 125.")])
+    assert filas[0]["valor"] == 500000
+
+
+def test_factura_en_pesos_sin_mencion_de_usd_no_cambia(escanear, trm_fija):
+    _, _, filas = escanear([correo(RELLENOS, "Total a pagar $ 820.000")])
+    assert filas[0]["valor"] == 820000
+
+
+def test_usd_sin_trm_no_se_registra_y_se_reintenta(escanear, trm_fija):
+    """Sin TRM no se guarda un valor equivocado; la siguiente corrida lo vuelve a intentar."""
+    crudo = correo(XAI["asunto"], XAI["cuerpo"], remitente=XAI["remitente"])
+    trm_fija["trm"] = None
+    assert escanear([crudo])[0] == 0
+    trm_fija["trm"] = Decimal("4000.00")
+    insertadas, _, filas = escanear([crudo])
+    assert insertadas == 1 and filas[0]["valor"] == 405480
+
+
+def test_analisis_suma_los_dolares_ya_convertidos(bot, sheets_falso):
+    cfg, hoja1, analisis = sheets_falso
+    hoja1.filas = [
+        list(bot.SHEET_HEADERS),
+        ["xAI", "Tue, 08 Sep 2026 15:37:40 +0000", "N/A", "1" * 32, "405480", "x", "invoice", "USD 101.37 x TRM 4000.00 (2026-09-08)"],
+        ["RELLENOS Y FIBRAS", "Tue, 29 Sep 2026 12:53:59 +0000", "FE 10647", "2" * 32, "1230000", "x", "factura"],
+    ]
+    bot.sync_to_google_sheets(cfg, [])
+    por_proveedor = {f[0]: f[1] for f in analisis.filas[1:]}
+    assert por_proveedor == {"RELLENOS Y FIBRAS": 1230000, "xAI": 405480, "TOTAL": 1635480}
+
+
+@pytest.mark.parametrize("crudo, esperado", [
+    ("$101.37", "101.37"), ("101.3700", "101.37"), ("1,234.56", "1234.56"), ("1.234,56", "1234.56"),
+    ("$1,234", "1234"), ("USD 158.00", "158"), ("158", "158"), ("$ 0.99", "0.99"),
+])
+def test_monto_con_decimales(bot, crudo, esperado):
+    assert bot._parse_decimal_amount(crudo) == Decimal(esperado)
+
+
+def test_consulta_de_trm(bot, monkeypatch):
+    """Lee la TRM vigente, la guarda en memoria y descarta valores absurdos."""
+    import io as _io
+    import json as _json
+    llamadas = []
+    respuestas = [[], [{"valor": "4123.45", "vigenciadesde": "2026-09-29T00:00:00.000"}]]
+
+    def urlopen_falso(url, timeout=None):
+        llamadas.append(url)
+        return _io.BytesIO(_json.dumps(respuestas[min(len(llamadas), len(respuestas)) - 1]).encode())
+
+    monkeypatch.setattr(bot.urllib.request, "urlopen", urlopen_falso)
+    monkeypatch.setattr(bot, "_TRM_CACHE", {})
+    dia = datetime(2026, 9, 29).date()
+    assert bot.get_trm_for_date(dia) == Decimal("4123.45")     # 1ª consulta vacía, usa la más reciente
+    assert bot.get_trm_for_date(dia) == Decimal("4123.45")     # sale de la memoria
+    assert len(llamadas) == 2
+    assert "datos.gov.co" in llamadas[0]
+
+    respuestas[:] = [[{"valor": "4.12"}]]
+    monkeypatch.setattr(bot, "_TRM_CACHE", {})
+    assert bot.get_trm_for_date(dia) is None                   # valor absurdo: no se usa
