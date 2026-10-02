@@ -1713,6 +1713,19 @@ def extract_structured_email_invoice_and_supplier(subject: str, body_text: str) 
     return invoice, seller
 
 
+# Proveedores cuyas facturas traen la razon social de la persona y deben
+# aparecer con su nombre comercial. La clave va en minusculas, sin espacios
+# ni puntos (ver _supplier_key).
+SUPPLIER_ALIASES = {
+    "luzeditgilduque": "RELLENOS Y FIBRAS",
+}
+
+
+def _apply_supplier_alias(name: str) -> str:
+    """Devuelve el nombre comercial configurado para el proveedor, si tiene uno."""
+    return SUPPLIER_ALIASES.get(_supplier_key(name), name)
+
+
 def _supplier_key(name: str) -> str:
     """Nombre de proveedor reducido a letras y numeros, para comparar sin importar puntos o mayusculas."""
     return re.sub(r"[^a-z0-9]", "", _supplier_name(name or "").lower())
@@ -1887,6 +1900,7 @@ def _scan_and_store(
                 supplier_name = extract_supplier_name_from_pdf_attachments(msg)
             if not supplier_name:
                 supplier_name = _supplier_name(from_real)
+            supplier_name = _apply_supplier_alias(supplier_name)
 
             # Prioridad: valor etiquetado en texto -> adjunto -> fallback números
             # El total legal del XML manda sobre cualquier "total" del correo.
@@ -2082,10 +2096,12 @@ def _ensure_header_row(ws) -> None:
     aunque tenga otros titulos, se deja como esta.
     """
     values = ws.get_all_values()
-    if not values:
-        ws.append_row(SHEET_HEADERS, value_input_option="USER_ENTERED")
+    first_row = values[0] if values else []
+    # Hoja nueva o fila 1 en blanco. En una hoja vacia gspread devuelve [[]],
+    # no una lista vacia, asi que se revisa el contenido de la fila.
+    if not any(str(cell).strip() for cell in first_row):
+        ws.update(range_name="A1", values=[SHEET_HEADERS], value_input_option="USER_ENTERED")
         return
-    first_row = values[0]
     first_key = str(first_row[3]).strip() if len(first_row) >= 4 else ""
     if re.fullmatch(r"[0-9a-f]{32}", first_key):
         _insert_rows_at(ws, [SHEET_HEADERS], 1)
