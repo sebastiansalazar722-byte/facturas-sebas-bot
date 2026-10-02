@@ -1716,21 +1716,70 @@ def _sheet_message_key(message_id: str, invoice_number: str, value: int) -> str:
     return hashlib.sha256(raw).hexdigest()[:32]
 
 
+SHEET_HEADERS = [
+    "Proveedor",
+    "Fecha correo",
+    "Factura",
+    "ID documento",
+    "Valor",
+    "Asunto / detalle",
+    "Keyword",
+    "Notas",
+]
+
+
+def _insert_rows_at(ws, rows, row_index: int) -> None:
+    """Inserta filas en una posicion exacta de la hoja (row_index empieza en 1).
+
+    Primero abre el espacio (las filas existentes bajan) y luego escribe en
+    ese rango exacto. No se usa insert_rows() de gspread porque internamente
+    hace un "append", que decide por su cuenta donde termina la tabla.
+    """
+    ws.spreadsheet.batch_update({
+        "requests": [{
+            "insertDimension": {
+                "range": {
+                    "sheetId": ws.id,
+                    "dimension": "ROWS",
+                    "startIndex": row_index - 1,
+                    "endIndex": row_index - 1 + len(rows),
+                },
+                "inheritFromBefore": False,
+            }
+        }]
+    })
+    ws.update(range_name=f"A{row_index}", values=rows, value_input_option="USER_ENTERED")
+
+
 def _ensure_header_row(ws) -> None:
-    """Create headers only when the worksheet is empty."""
-    if not ws.get_all_values():
-        ws.append_row(
-            [
-                "Proveedor",
-                "Fecha correo",
-                "Factura",
-                "ID documento",
-                "Valor",
-                "Asunto / detalle",
-                "Keyword",
-            ],
-            value_input_option="USER_ENTERED",
-        )
+    """Garantiza que la fila 1 de hoja1 sea el encabezado.
+
+    Hoja vacia: se escribe el encabezado. Hoja con datos y sin encabezado
+    (la fila 1 trae un hash de 32 caracteres en la columna D): se inserta el
+    encabezado arriba sin tocar los datos. Si la fila 1 ya es un encabezado,
+    aunque tenga otros titulos, se deja como esta.
+    """
+    values = ws.get_all_values()
+    if not values:
+        ws.append_row(SHEET_HEADERS, value_input_option="USER_ENTERED")
+        return
+    first_row = values[0]
+    first_key = str(first_row[3]).strip() if len(first_row) >= 4 else ""
+    if re.fullmatch(r"[0-9a-f]{32}", first_key):
+        _insert_rows_at(ws, [SHEET_HEADERS], 1)
+
+
+def _email_date_sort_key(email_date: str) -> float:
+    """Fecha del correo como numero, para ordenar de la mas reciente a la mas antigua."""
+    value = str(email_date or "").strip()
+    try:
+        return parsedate_to_datetime(value).timestamp()
+    except Exception:
+        pass
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
 
 
 def _load_existing_sheet_keys(ws) -> set:
@@ -1853,7 +1902,11 @@ def sync_to_google_sheets(cfg: Config, records: List[InvoiceRecord]) -> dict:
         existing_keys.add(key)
 
     if rows_to_append:
-        facturas_ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
+        # Las facturas nuevas entran arriba, en la fila 2 (debajo del
+        # encabezado), con la mas reciente primero. Las filas que ya estaban
+        # bajan sin modificarse.
+        rows_to_append.sort(key=lambda row: _email_date_sort_key(row[1]), reverse=True)
+        _insert_rows_at(facturas_ws, rows_to_append, 2)
 
     # Rebuild analysis from SQLite so it always represents the complete history.
     headers, analysis_rows = _analysis_data(records)
@@ -1864,6 +1917,7 @@ def sync_to_google_sheets(cfg: Config, records: List[InvoiceRecord]) -> dict:
     # Basic formatting matching the historical sheet: dark header + percentage on last column.
     try:
         facturas_ws.freeze(rows=1)
+        facturas_ws.format("1:1", {"textFormat": {"bold": True}})
         analysis_ws.freeze(rows=1)
         analysis_ws.format("1:1", {
             "backgroundColor": {"red": 0.12, "green": 0.27, "blue": 0.47},
