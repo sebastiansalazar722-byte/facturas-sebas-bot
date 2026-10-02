@@ -193,8 +193,12 @@ def escanear(tmp_path):
 
 
 class HojaFalsa:
-    def __init__(self, filas=None):
+    """Imita las operaciones de gspread que usa el bot sobre una pestaña."""
+
+    def __init__(self, filas=None, sheet_id=0):
         self.filas = [list(f) for f in (filas or [])]
+        self.id = sheet_id
+        self.spreadsheet = self
 
     def get_all_values(self):
         return [list(f) for f in self.filas]
@@ -205,11 +209,26 @@ class HojaFalsa:
     def append_rows(self, filas, value_input_option=None):
         self.filas.extend(list(f) for f in filas)
 
+    def batch_update(self, body):
+        """Solo insertDimension de filas: abre filas vacías y baja las existentes."""
+        for peticion in body["requests"]:
+            rango = peticion["insertDimension"]["range"]
+            assert rango["sheetId"] == self.id and rango["dimension"] == "ROWS"
+            inicio, fin = rango["startIndex"], rango["endIndex"]
+            while len(self.filas) < inicio:
+                self.filas.append([])
+            self.filas[inicio:inicio] = [[] for _ in range(fin - inicio)]
+
     def clear(self):
         self.filas = []
 
     def update(self, range_name=None, values=None, value_input_option=None):
-        self.filas = [list(f) for f in (values or [])]
+        """Escribe a partir de la celda A<n>, sobrescribiendo solo esas filas."""
+        inicio = int(range_name.lstrip("A")) - 1
+        for i, fila in enumerate(values or []):
+            while len(self.filas) <= inicio + i:
+                self.filas.append([])
+            self.filas[inicio + i] = list(fila)
 
     def freeze(self, rows=None):
         pass
