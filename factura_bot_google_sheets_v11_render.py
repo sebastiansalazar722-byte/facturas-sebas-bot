@@ -1238,6 +1238,58 @@ def extract_supplier_name_from_pdf_attachments(msg: email.message.Message) -> st
 def extract_supplier_name_from_attachments(msg: email.message.Message) -> str:
     return extract_supplier_name_from_xml_attachments(msg) or extract_supplier_name_from_pdf_attachments(msg)
 
+def extract_credit_note_from_xml_bytes(xml_bytes: bytes) -> Optional[Tuple[str, Optional[Tuple[int, str, str]]]]:
+    """Si el XML es una nota credito devuelve (numero, valor); si no lo es, None.
+
+    Revisa el documento directo y el embebido en un AttachedDocument. El valor
+    sale de LegalMonetaryTotal y puede venir vacio (None) si no se pudo leer.
+    """
+    try:
+        root = ET.fromstring(xml_bytes)
+    except Exception:
+        return None
+    doc_roots = [root] + _embedded_invoice_roots(root)
+    tags = [doc.tag.split("}")[-1].lower() for doc in doc_roots]
+    if "invoice" in tags or "creditnote" not in tags:
+        return None
+    note = doc_roots[tags.index("creditnote")]
+
+    number = ""
+    for child in list(note):
+        if child.tag.split("}")[-1].lower() == "id" and (child.text or "").strip():
+            number = _normalize_invoice_candidate(child.text.strip())
+            break
+
+    value: Optional[Tuple[int, str, str]] = None
+    for legal_total in note.iter():
+        if legal_total.tag.split("}")[-1] != "LegalMonetaryTotal":
+            continue
+        for tag_name in ("PayableAmount", "TaxInclusiveAmount"):
+            node = next((e for e in legal_total.iter() if e.tag.split("}")[-1] == tag_name), None)
+            raw = (node.text or "").strip() if node is not None else ""
+            if not raw:
+                continue
+            try:
+                amount = int(Decimal(raw.replace(",", "")))
+            except Exception:
+                continue
+            if amount > 0:
+                value = (amount, node.attrib.get("currencyID") or detect_currency(raw), raw)
+                break
+        if value:
+            break
+    return number, value
+
+
+def extract_credit_note_from_attachments(msg: email.message.Message) -> Optional[Tuple[str, Optional[Tuple[int, str, str]]]]:
+    for filename, payload in iter_supported_attachment_files(msg):
+        if filename.lower().endswith(".xml"):
+            found = extract_credit_note_from_xml_bytes(payload)
+            if found is not None:
+                return found
+    return None
+
+
 def extract_invoice_number_from_xml_attachments(msg: email.message.Message) -> str:
     # XML has priority because it contains the structured DIAN document ID.
     for filename, payload in iter_supported_attachment_files(msg):
@@ -1657,6 +1709,45 @@ def process_mail_once(
 
 def extract_structured_email_invoice_and_supplier(subject: str, body_text: str) -> Tuple[str, str]:
     """Read DIAN forwarding subjects in NIT;SELLER;INVOICE;... format."""
+    invoice, seller, _doc_type, _nit = _extract_structured_fields(subject, body_text)
+    return invoice, seller
+
+
+def _supplier_key(name: str) -> str:
+    """Nombre de proveedor reducido a letras y numeros, para comparar sin importar puntos o mayusculas."""
+    return re.sub(r"[^a-z0-9]", "", _supplier_name(name or "").lower())
+
+
+def _resolve_duplicate_invoices(pending: List[Tuple[InvoiceRecord, bool, str]]) -> List[InvoiceRecord]:
+    """Una misma factura que llega en dos correos queda una sola vez.
+
+    Se reconoce por numero de factura y proveedor (el NIT del asunto
+    estructurado si lo hay; si no, el nombre). Si uno de los correos trae el
+    valor del XML y el otro no, se conserva el del XML; si no, el primero.
+    """
+    result: List[Tuple[InvoiceRecord, bool]] = []
+    position: Dict[Tuple[str, str], int] = {}
+    for rec, from_xml, supplier_nit in pending:
+        if not rec.invoice_number:
+            result.append((rec, from_xml))
+            continue
+        key = (rec.invoice_number.strip().upper(), supplier_nit or _supplier_key(rec.remitente_real))
+        if key not in position:
+            position[key] = len(result)
+            result.append((rec, from_xml))
+            continue
+        kept_rec, kept_from_xml = result[position[key]]
+        if from_xml and not kept_from_xml:
+            result[position[key]] = (rec, from_xml)
+        logging.info(
+            "Factura repetida en otro correo; se conserva una sola fila. factura=%s proveedor=%s valores=%s/%s",
+            rec.invoice_number, rec.remitente_real, kept_rec.valor_entero, rec.valor_entero,
+        )
+    return [rec for rec, _from_xml in result]
+
+
+def _extract_structured_fields(subject: str, body_text: str) -> Tuple[str, str, str, str]:
+    """Devuelve (factura, proveedor, tipo de documento, NIT) del formato NIT;PROVEEDOR;FACTURA;TIPO;..."""
     texts = [subject or "", body_text or ""]
     for text in texts:
         for raw_line in re.split(r"[\r\n]+", text):
@@ -1686,8 +1777,8 @@ def extract_structured_email_invoice_and_supplier(subject: str, body_text: str) 
                 continue
             if re.fullmatch(r"[\d .()\-]+", seller):
                 continue
-            return invoice, seller
-    return "", ""
+            return invoice, seller, (parts[3] if len(parts) >= 4 else ""), nit
+    return "", "", "", ""
 
 def _scan_and_store(
     mail,
@@ -1700,6 +1791,7 @@ def _scan_and_store(
 ) -> Tuple[int, int]:
     inserted = 0
     skipped_excluded = 0
+    pending: List[Tuple[InvoiceRecord, bool, str]] = []
 
     for num in ids:
         try:
@@ -1737,16 +1829,22 @@ def _scan_and_store(
 
             is_special_case = special_supplier or attachment_special
 
-            if not is_special_case and (contains_excluded_term(subject) or contains_excluded_term(body_text)):
-                skipped_excluded += 1
-                continue
-
             # DIAN forwarding emails can be structured as NIT;PROVEEDOR;FACTURA;...
             # without containing the word "factura". Recognize that structure
             # before the keyword gate. All existing XML/PDF/value logic stays intact.
-            structured_invoice, structured_supplier = extract_structured_email_invoice_and_supplier(
+            structured_invoice, structured_supplier, structured_type, structured_nit = _extract_structured_fields(
                 subject, body_text
             )
+
+            # Un asunto con estructura valida es una factura aunque el correo
+            # mencione la DIAN: la exclusion no aplica en ese caso.
+            if (
+                not is_special_case
+                and not structured_invoice
+                and (contains_excluded_term(subject) or contains_excluded_term(body_text))
+            ):
+                skipped_excluded += 1
+                continue
 
             keyword = body_keyword or attachment_keyword
             if not keyword and structured_invoice:
@@ -1761,8 +1859,18 @@ def _scan_and_store(
 
             # The invoice document is the source of truth. Prefer XML/PDF
             # over the email subject/body because email templates vary by sender.
+            # Nota credito: tipo de documento 91 en el asunto, o XML CreditNote.
+            credit_note = extract_credit_note_from_attachments(msg)
+            is_credit_note = structured_type == "91" or credit_note is not None
+            credit_note_number, credit_note_value = credit_note if credit_note else ("", None)
+
             # Prioridad: XML > asunto estructurado > texto de adjuntos > texto del correo.
-            invoice_number = extract_invoice_number_from_xml_attachments(msg)
+            # En una nota credito manda su propio numero, no el de la factura que corrige.
+            invoice_number = ""
+            if is_credit_note:
+                invoice_number = structured_invoice or credit_note_number
+            if not invoice_number:
+                invoice_number = extract_invoice_number_from_xml_attachments(msg)
             if not invoice_number:
                 invoice_number = structured_invoice
             if not invoice_number:
@@ -1782,7 +1890,9 @@ def _scan_and_store(
 
             # Prioridad: valor etiquetado en texto -> adjunto -> fallback números
             # El total legal del XML manda sobre cualquier "total" del correo.
-            best_value = extract_xml_value_from_attachments(msg)
+            best_value = credit_note_value if is_credit_note else None
+            if best_value is None:
+                best_value = extract_xml_value_from_attachments(msg)
             value_from_xml = best_value is not None
             if best_value is None:
                 best_value = find_best_total_by_labels(haystack)
@@ -1823,6 +1933,10 @@ def _scan_and_store(
                         continue
                     value_int = int((usd_amount * trm).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
                     currency = f"USD {usd_amount:.2f} x TRM {trm:.2f} ({trm_day.isoformat()})"
+                if is_credit_note:
+                    # La nota credito resta: se guarda con valor negativo.
+                    value_int = -abs(value_int)
+                    keyword = "nota credito"
                 rec = InvoiceRecord(
                     message_id=message_id,
                     uid=uid,
@@ -1836,11 +1950,17 @@ def _scan_and_store(
                     moneda=currency,
                     palabra_clave=keyword,
                 )
-                if insert_invoice(db_path, rec):
-                    inserted += 1
+                pending.append((rec, value_from_xml, structured_nit))
 
         except Exception as exc:
             logging.exception("Error procesando mensaje %r: %s", num, exc)
+
+    for rec in _resolve_duplicate_invoices(pending):
+        try:
+            if insert_invoice(db_path, rec):
+                inserted += 1
+        except Exception as exc:
+            logging.exception("Error guardando factura %r: %s", rec.invoice_number, exc)
 
     return inserted, skipped_excluded
 
@@ -2130,6 +2250,19 @@ def sync_to_google_sheets(cfg: Config, records: List[InvoiceRecord]) -> dict:
 
     _ensure_header_row(facturas_ws)
     existing_keys = _load_existing_sheet_keys(facturas_ws)
+    # Facturas que ya estan en la hoja, por (numero, proveedor) y por (numero, valor):
+    # la misma factura puede llegar en otro correo y no debe quedar dos veces.
+    seen_by_supplier, seen_by_value = set(), set()
+    for sheet_row in facturas_ws.get_all_values():
+        if len(sheet_row) < 5:
+            continue
+        sheet_invoice = str(sheet_row[2]).strip().upper()
+        if not sheet_invoice or sheet_invoice == "N/A":
+            continue
+        seen_by_supplier.add((sheet_invoice, _supplier_key(str(sheet_row[0]))))
+        sheet_value = _sheet_value_to_int(sheet_row[4])
+        if sheet_value is not None:
+            seen_by_value.add((sheet_invoice, sheet_value))
     rows_to_append = []
 
     for rec in records:
@@ -2140,6 +2273,14 @@ def sync_to_google_sheets(cfg: Config, records: List[InvoiceRecord]) -> dict:
         key = _sheet_message_key(rec.message_id, rec.invoice_number, key_amount)
         if key in existing_keys:
             continue
+        invoice_id = (rec.invoice_number or "").strip().upper()
+        if invoice_id:
+            supplier_id = (invoice_id, _supplier_key(rec.remitente_real))
+            value_id = (invoice_id, rec.valor_entero)
+            if supplier_id in seen_by_supplier or value_id in seen_by_value:
+                continue
+            seen_by_supplier.add(supplier_id)
+            seen_by_value.add(value_id)
         row = [
             _supplier_name(rec.remitente_real),
             rec.email_date,
@@ -2149,8 +2290,14 @@ def sync_to_google_sheets(cfg: Config, records: List[InvoiceRecord]) -> dict:
             rec.asunto or "",
             rec.palabra_clave or "",
         ]
+        # Columna H (Notas): nota credito y, si aplica, monto en USD, TRM y fecha.
+        notes = []
+        if rec.valor_entero < 0:
+            notes.append("NOTA CREDITO")
         if usd_amount is not None:
-            row.append(rec.moneda)  # columna H (Notas): monto en USD, TRM y fecha
+            notes.append(rec.moneda)
+        if notes:
+            row.append(" | ".join(notes))
         rows_to_append.append(row)
         existing_keys.add(key)
 
