@@ -28,12 +28,6 @@ def test_estructura_valida_con_la_palabra_dian():
     pass
 
 
-@pytest.mark.skip(reason="DECISIÓN PENDIENTE: facturas en USD se suman como COP en Análisis "
-                         "(la moneda no se escribe en la hoja).")
-def test_facturas_en_dolares():
-    pass
-
-
 @pytest.mark.skip(reason="DECISIÓN PENDIENTE: la misma factura puede entrar dos veces si llega en dos "
                          "correos con valores distintos (caso FE 10148: 820.000 y 802.773). ¿Cuál valor manda?")
 def test_misma_factura_con_dos_valores():
