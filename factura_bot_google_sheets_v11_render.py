@@ -19,6 +19,7 @@ import hashlib
 import email
 import imaplib
 import io
+import json
 import logging
 import os
 import re
@@ -27,11 +28,14 @@ import ssl
 import sys
 import time
 import tempfile
+import urllib.parse
+import urllib.request
 import zipfile
 import xml.etree.ElementTree as ET
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from email.header import decode_header, make_header
 from email.message import EmailMessage
 from email.utils import parsedate_to_datetime
@@ -461,6 +465,86 @@ def detect_currency(raw_value: str) -> str:
     if "EUR" in upper or "€" in raw_value:
         return "EUR"
     return "N/A"
+
+
+# ---------------------------------------------------------------------------
+# Facturas en dolares: conversion a pesos con la TRM oficial
+# ---------------------------------------------------------------------------
+# Datos abiertos de la Superintendencia Financiera (datos.gov.co).
+TRM_API_URL = "https://www.datos.gov.co/resource/32sa-8pi3.json"
+_TRM_CACHE: Dict[str, Decimal] = {}
+
+
+def colombia_today() -> date:
+    """Fecha de hoy en Colombia (UTC-5), sin depender de la zona horaria del servidor."""
+    return (datetime.now(timezone.utc) - timedelta(hours=5)).date()
+
+
+def get_trm_for_date(day: date) -> Optional[Decimal]:
+    """TRM oficial vigente en la fecha indicada. Devuelve None si no se pudo consultar."""
+    key = day.isoformat()
+    if key in _TRM_CACHE:
+        return _TRM_CACHE[key]
+    stamp = f"{key}T00:00:00.000"
+    queries = [
+        {"$where": f"vigenciadesde <= '{stamp}' AND vigenciahasta >= '{stamp}'", "$limit": "1"},
+        {"$order": "vigenciadesde DESC", "$limit": "1"},
+    ]
+    for query in queries:
+        try:
+            url = TRM_API_URL + "?" + urllib.parse.urlencode(query)
+            with urllib.request.urlopen(url, timeout=20) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            if data and data[0].get("valor"):
+                trm = Decimal(str(data[0]["valor"]))
+                # Rango de cordura: evita convertir con un dato corrupto.
+                if Decimal("1000") <= trm <= Decimal("20000"):
+                    _TRM_CACHE[key] = trm
+                    return trm
+        except Exception as exc:
+            logging.warning("No se pudo consultar la TRM (%s): %s", key, exc)
+    return None
+
+
+def _parse_decimal_amount(raw: str) -> Optional[Decimal]:
+    """Monto con decimales a partir de un texto: '$101.37', '1,234.56', '1.234,56', '101.3700'."""
+    text = re.sub(r"[^\d.,]", "", raw or "").strip(".,")
+    if not text:
+        return None
+    last_dot, last_comma = text.rfind("."), text.rfind(",")
+    decimal_sep = ""
+    if last_dot >= 0 and last_comma >= 0:
+        decimal_sep = "." if last_dot > last_comma else ","
+    elif last_dot >= 0 or last_comma >= 0:
+        sep = "." if last_dot >= 0 else ","
+        digits_after = len(text) - text.rfind(sep) - 1
+        # Un solo separador seguido de exactamente 3 digitos es de miles (1,234).
+        if text.count(sep) == 1 and digits_after != 3:
+            decimal_sep = sep
+    if decimal_sep:
+        whole, fraction = text.rsplit(decimal_sep, 1)
+    else:
+        whole, fraction = text, ""
+    whole = re.sub(r"[.,]", "", whole)
+    try:
+        return Decimal(f"{whole or '0'}.{fraction or '0'}")
+    except Exception:
+        return None
+
+
+def _text_says_usd(text: str) -> bool:
+    """True si el documento habla de dolares (USD / US$) y no menciona COP."""
+    if not text:
+        return False
+    has_usd = bool(re.search(r"\bUSD\b|US\$", text, flags=re.I))
+    has_cop = bool(re.search(r"\bCOP\b", text, flags=re.I))
+    return has_usd and not has_cop
+
+
+def _usd_amount_from_note(moneda: str) -> Optional[Decimal]:
+    """Monto original en dolares guardado en el campo moneda ('USD 101.37 x TRM ...')."""
+    match = re.match(r"USD (\d+\.\d{2}) x TRM ", moneda or "")
+    return Decimal(match.group(1)) if match else None
 
 
 def _compile_money_matches(text: str) -> List[Tuple[int, int, str]]:
@@ -1699,6 +1783,7 @@ def _scan_and_store(
             # Prioridad: valor etiquetado en texto -> adjunto -> fallback números
             # El total legal del XML manda sobre cualquier "total" del correo.
             best_value = extract_xml_value_from_attachments(msg)
+            value_from_xml = best_value is not None
             if best_value is None:
                 best_value = find_best_total_by_labels(haystack)
             if best_value is None:
@@ -1717,6 +1802,27 @@ def _scan_and_store(
                 selected_values = [max(values, key=lambda x: x[0])]
 
             for value_int, currency, _literal in selected_values:
+                # Facturas en dolares: con XML manda su moneda (currencyID). Sin
+                # XML, es USD si el correo o el adjunto dicen USD y no dicen COP.
+                if value_from_xml:
+                    is_usd = str(currency or "").upper() == "USD"
+                else:
+                    document_text = haystack + "\n" + "\n".join(
+                        text for _name, text in extract_attachment_texts(msg)
+                    )
+                    is_usd = _text_says_usd(document_text)
+                if is_usd:
+                    usd_amount = _parse_decimal_amount(_literal)
+                    trm_day = colombia_today()
+                    trm = get_trm_for_date(trm_day)
+                    if usd_amount is None or usd_amount <= 0 or trm is None:
+                        logging.error(
+                            "Factura en USD sin convertir (monto o TRM no disponible); "
+                            "se reintenta en la proxima corrida. Asunto=%s", subject,
+                        )
+                        continue
+                    value_int = int((usd_amount * trm).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+                    currency = f"USD {usd_amount:.2f} x TRM {trm:.2f} ({trm_day.isoformat()})"
                 rec = InvoiceRecord(
                     message_id=message_id,
                     uid=uid,
@@ -2027,10 +2133,14 @@ def sync_to_google_sheets(cfg: Config, records: List[InvoiceRecord]) -> dict:
     rows_to_append = []
 
     for rec in records:
-        key = _sheet_message_key(rec.message_id, rec.invoice_number, rec.valor_entero)
+        # En facturas en dolares la clave usa el monto original en centavos de
+        # USD: el valor en pesos cambia con la TRM de cada dia y duplicaria la fila.
+        usd_amount = _usd_amount_from_note(rec.moneda)
+        key_amount = int(usd_amount * 100) if usd_amount is not None else rec.valor_entero
+        key = _sheet_message_key(rec.message_id, rec.invoice_number, key_amount)
         if key in existing_keys:
             continue
-        rows_to_append.append([
+        row = [
             _supplier_name(rec.remitente_real),
             rec.email_date,
             rec.invoice_number or "N/A",
@@ -2038,7 +2148,10 @@ def sync_to_google_sheets(cfg: Config, records: List[InvoiceRecord]) -> dict:
             rec.valor_entero,
             rec.asunto or "",
             rec.palabra_clave or "",
-        ])
+        ]
+        if usd_amount is not None:
+            row.append(rec.moneda)  # columna H (Notas): monto en USD, TRM y fecha
+        rows_to_append.append(row)
         existing_keys.add(key)
 
     if rows_to_append:
