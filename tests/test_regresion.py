@@ -279,7 +279,7 @@ def _registro(bot, message_id="<a@correo.test>", factura="FE 10647", valor=12300
 
 def test_sheets_fila_con_columnas_a_g(bot, sheets_falso):
     cfg, hoja1, _ = sheets_falso
-    hoja1.filas = [["X", "f", "FE 1", "hash-existente", "1", "d", "factura"]]  # hoja real: sin encabezado
+    hoja1.filas = [list(bot.SHEET_HEADERS), ["X", "f", "FE 1", "hash-existente", "1", "d", "factura"]]
     bot.sync_to_google_sheets(cfg, [_registro(bot)])
     assert hoja1.filas[1] == [
         "RELLENOS Y FIBRAS", "Tue, 29 Sep 2026 12:53:59 +0000", "FE 10647",
@@ -301,6 +301,73 @@ def test_sheets_factura_sin_numero_se_escribe_na(bot, sheets_falso):
     cfg, hoja1, _ = sheets_falso
     bot.sync_to_google_sheets(cfg, [_registro(bot, factura="")])
     assert hoja1.filas[-1][2] == "N/A"
+
+
+HASH_VIEJO_1 = "a" * 32
+HASH_VIEJO_2 = "b" * 32
+
+
+def test_sheets_hoja_vacia_recibe_encabezado(bot, sheets_falso):
+    cfg, hoja1, _ = sheets_falso
+    bot.sync_to_google_sheets(cfg, [_registro(bot)])
+    assert hoja1.filas[0] == ["Proveedor", "Fecha correo", "Factura", "ID documento", "Valor",
+                              "Asunto / detalle", "Keyword", "Notas"]
+    assert hoja1.filas[1][2] == "FE 10647"
+
+
+def test_sheets_hoja_con_datos_y_sin_encabezado_lo_recibe_arriba(bot, sheets_falso):
+    """Caso de la hoja real hoy: tiene filas pero no tiene títulos."""
+    cfg, hoja1, _ = sheets_falso
+    vieja = ["PROVEEDOR VIEJO", "Tue, 01 Sep 2026 15:25:09 +0000", "FE 1", HASH_VIEJO_1, "1000", "x", "factura", "NOTA A MANO"]
+    hoja1.filas = [list(vieja)]
+    bot.sync_to_google_sheets(cfg, [])
+    assert hoja1.filas == [bot.SHEET_HEADERS, vieja]
+
+
+def test_sheets_encabezado_no_se_duplica(bot, sheets_falso):
+    cfg, hoja1, _ = sheets_falso
+    for _ in range(3):
+        bot.sync_to_google_sheets(cfg, [_registro(bot)])
+    assert [f[0] for f in hoja1.filas] == ["Proveedor", "RELLENOS Y FIBRAS"]
+
+
+def test_sheets_respeta_un_encabezado_escrito_a_mano(bot, sheets_falso):
+    cfg, hoja1, _ = sheets_falso
+    hoja1.filas = [["EMPRESA", "FECHA", "No. FACTURA", "ID", "VALOR", "DETALLE", "TIPO"]]
+    bot.sync_to_google_sheets(cfg, [_registro(bot)])
+    assert hoja1.filas[0][0] == "EMPRESA" and len(hoja1.filas) == 2
+
+
+def test_sheets_facturas_nuevas_entran_arriba(bot, sheets_falso):
+    """Las nuevas van en la fila 2; las que ya estaban bajan intactas y en su mismo orden."""
+    cfg, hoja1, _ = sheets_falso
+    vieja_1 = ["A", "Tue, 01 Sep 2026 15:25:09 +0000", "FE 1", HASH_VIEJO_1, "1000", "x", "factura", "NOTA A MANO"]
+    vieja_2 = ["B", "Mon, 03 Aug 2026 15:38:26 +0000", "FE 2", HASH_VIEJO_2, "2000", "x", "factura"]
+    hoja1.filas = [list(bot.SHEET_HEADERS), list(vieja_1), list(vieja_2)]
+    bot.sync_to_google_sheets(cfg, [_registro(bot)])
+    assert hoja1.filas[0] == bot.SHEET_HEADERS
+    assert hoja1.filas[1][2] == "FE 10647"
+    assert hoja1.filas[2:] == [vieja_1, vieja_2]
+
+
+def test_sheets_lote_nuevo_queda_de_la_mas_reciente_a_la_mas_antigua(bot, sheets_falso):
+    cfg, hoja1, _ = sheets_falso
+    registros = [
+        _registro(bot, message_id="<1@x>", factura="FE 100", fecha="Tue, 01 Sep 2026 10:00:00 +0000"),
+        _registro(bot, message_id="<3@x>", factura="FE 300", fecha="Thu, 01 Oct 2026 16:18:11 +0000"),
+        _registro(bot, message_id="<2@x>", factura="FE 200", fecha="Tue, 29 Sep 2026 18:00:00 -0500"),
+    ]
+    bot.sync_to_google_sheets(cfg, registros)
+    assert [f[2] for f in hoja1.filas[1:]] == ["FE 300", "FE 200", "FE 100"]
+
+
+def test_sheets_corridas_sucesivas_dejan_lo_ultimo_arriba(bot, sheets_falso):
+    cfg, hoja1, _ = sheets_falso
+    ayer = _registro(bot, message_id="<1@x>", factura="FE 100", fecha="Wed, 30 Sep 2026 15:00:00 +0000")
+    hoy = _registro(bot, message_id="<2@x>", factura="FE 200", fecha="Thu, 01 Oct 2026 15:00:00 +0000")
+    bot.sync_to_google_sheets(cfg, [ayer])
+    bot.sync_to_google_sheets(cfg, [ayer, hoy])
+    assert [f[2] for f in hoja1.filas[1:]] == ["FE 200", "FE 100"]
 
 
 def test_sheets_desactivado_no_hace_nada(bot):
@@ -355,7 +422,7 @@ def corrida_diaria(bot, monkeypatch, tmp_path, sheets_falso):
     """
     cfg, hoja1, analisis = sheets_falso
     # Como la hoja real: ya tiene filas y no tiene encabezado.
-    hoja1.filas = [["PROVEEDOR VIEJO", "Tue, 01 Sep 2026 15:25:09 +0000", "FE 1", "hash-viejo", "1000", "x", "factura"]]
+    hoja1.filas = [["PROVEEDOR VIEJO", "Tue, 01 Sep 2026 15:25:09 +0000", "FE 1", "c" * 32, "1000", "x", "factura"]]
     monkeypatch.setattr(bot, "send_summary_email", lambda *a, **k: None)
     contador = {"n": 0}
 
@@ -384,7 +451,7 @@ def test_corrida_diaria_recoge_correo_de_la_tarde_anterior(corrida_diaria):
     crudo = correo(RELLENOS, adjuntos=[("fv.xml", xml)], fecha="Wed, 09 Sep 2026 21:30:00 +0000")
     resultado = correr([crudo], datetime(2026, 9, 10, 1, 0, tzinfo=timezone.utc))
     assert resultado["inserted_first_pass"] == 1
-    assert [f[2] for f in hoja1.filas[1:]] == ["FE 10647"]
+    assert [f[2] for f in hoja1.filas] == ["Factura", "FE 10647", "FE 1"]
 
 
 def test_corridas_diarias_repetidas_no_duplican_hoja1(corrida_diaria):
@@ -394,11 +461,12 @@ def test_corridas_diarias_repetidas_no_duplican_hoja1(corrida_diaria):
     crudo = correo(RELLENOS, adjuntos=[("fv.xml", xml)], fecha="Wed, 09 Sep 2026 21:30:00 +0000")
     for hora in (1, 13, 19):
         correr([crudo], datetime(2026, 9, 10, hora, 0, tzinfo=timezone.utc))
-    assert [f[2] for f in hoja1.filas[1:]] == ["FE 10647"]
+    assert [f[2] for f in hoja1.filas] == ["Factura", "FE 10647", "FE 1"]
 
 
 def test_corrida_diaria_no_recoge_correos_de_anteayer(corrida_diaria):
     correr, hoja1 = corrida_diaria
     crudo = correo(RELLENOS, "Total a pagar $ 820.000", fecha="Mon, 07 Sep 2026 15:00:00 +0000")
     resultado = correr([crudo], datetime(2026, 9, 10, 1, 0, tzinfo=timezone.utc))
-    assert resultado["inserted_first_pass"] == 0 and len(hoja1.filas) == 1
+    assert resultado["inserted_first_pass"] == 0
+    assert [f[2] for f in hoja1.filas] == ["Factura", "FE 1"]
